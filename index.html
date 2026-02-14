@@ -1883,8 +1883,8 @@
                     </div>
                     
                     <div class="form-group">
-                        <label>Username</label>
-                        <input type="text" id="username" placeholder="Enter username">
+                       <label>Email</label>
+                       <input type="text" id="username" placeholder="Enter email (e.g., admin@miami.test)">
                     </div>
                     <div class="form-group">
                         <label>Password</label>
@@ -1896,6 +1896,11 @@
                         Admin: admin / admin123<br>
                         Tech: mike / tech123<br>
                         Tech: sarah / tech123
+                        <strong>Test Accounts:</strong><br>
+                        Miami Admin: admin@miami.test / Password123!<br>
+                        Miami Tech: tech.mike@miami.test / Password123!<br>
+                        FTL Admin: admin@ftl.test / Password123!<br>
+                        WPB Admin: admin@wpb.test / Password123!
                     </div>
                 </div>
             `;
@@ -2961,27 +2966,54 @@
         }
 
         // Event Handlers
-        function login() {
-            const username = document.getElementById('username').value;
-            const password = document.getElementById('password').value;
+       async function login() {
+    const email = document.getElementById('username').value;
+    const password = document.getElementById('password').value;
+    
+    if (USE_SUPABASE && supabase) {
+        try {
+            const { data, error } = await supabase.auth.signInWithPassword({
+                email: email,
+                password: password
+            });
             
-            if (users[username] && users[username].password === password) {
-                currentUser = {
-                    username: username,
-                    ...users[username]
-                };
+            if (error) {
+                alert('Invalid credentials: ' + error.message);
+                return;
+            }
+            
+            if (data.user) {
+                await loadUserProfile(data.user.id);
                 currentView = currentUser.role === 'technician' ? 'technician' : 'dashboard';
                 render();
-            } else {
-                alert('Invalid credentials');
             }
+        } catch (err) {
+            alert('Login error: ' + err.message);
         }
-
-        function logout() {
-            currentUser = null;
-            currentView = 'dashboard';
+    } else {
+        const username = email;
+        if (users[username] && users[username].password === password) {
+            currentUser = {
+                username: username,
+                ...users[username]
+            };
+            currentView = currentUser.role === 'technician' ? 'technician' : 'dashboard';
             render();
+        } else {
+            alert('Invalid credentials');
         }
+    }
+}
+
+       async function logout() {
+    if (USE_SUPABASE && supabase) {
+        await supabase.auth.signOut();
+    }
+    currentUser = null;
+    userLocation = null;
+    currentView = 'dashboard';
+    render();
+}
 
         function switchView(view) {
             currentView = view;
@@ -4866,9 +4898,13 @@ ${baseDirectory}/
         window.clearAllData = clearAllData;
         window.exportData = exportData;
 
-        // Initialize - Just render with sample data
-        // User must load their save file manually
+        // Initialize - Check for existing session, then render
+        async function init() {
+        await initializeAuth();
         render();
+    }
+
+    init();
     </script>
 </body>
 </html>
