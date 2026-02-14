@@ -961,8 +961,17 @@
         const SUPABASE_URL = 'https://fpmpujyjhkxtyvwuqwbt.supabase.co';
         const SUPABASE_ANON_KEY = 'fpmpujyjhkxtyvwuqwbt';
         
-        // Initialize Supabase client
-        const supabase = window.supabase.createClient(https://fpmpujyjhkxtyvwuqwbt.supabase.co, fpmpujyjhkxtyvwuqwbt);
+        // Initialize Supabase client (only if credentials are provided)
+        let supabase = null;
+        const USE_SUPABASE = SUPABASE_URL !== 'YOUR_SUPABASE_URL_HERE' && SUPABASE_ANON_KEY !== 'YOUR_SUPABASE_ANON_KEY_HERE';
+        
+        if (USE_SUPABASE && window.supabase) {
+            try {
+                supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+            } catch (error) {
+                console.error('Failed to initialize Supabase:', error);
+            }
+        }
         
         // User session
         let userSession = null;
@@ -973,6 +982,11 @@
         // ============================================
         
         async function initializeAuth() {
+            if (!USE_SUPABASE || !supabase) {
+                // Fallback to mock login if Supabase not configured
+                return;
+            }
+            
             const { data: { session } } = await supabase.auth.getSession();
             if (session) {
                 await loadUserProfile(session.user.id);
@@ -980,6 +994,8 @@
         }
         
         async function loadUserProfile(userId) {
+            if (!supabase) return;
+            
             const { data, error } = await supabase
                 .from('user_profiles')
                 .select(`
@@ -1007,7 +1023,7 @@
         // ============================================
         
         async function loadAllData() {
-            if (!userLocation) return;
+            if (!userLocation || !supabase) return;
             
             await Promise.all([
                 loadVehicles(),
@@ -1019,6 +1035,8 @@
         }
         
         async function loadVehicles() {
+            if (!supabase) return;
+            
             const { data, error } = await supabase
                 .from('vehicles')
                 .select('*')
@@ -1046,6 +1064,8 @@
         }
         
         async function loadVehicleNotes(vehicle) {
+            if (!supabase) return;
+            
             const { data } = await supabase
                 .from('vehicle_notes')
                 .select('*')
@@ -1063,6 +1083,8 @@
         }
         
         async function loadWorkflows() {
+            if (!supabase) return;
+            
             const { data } = await supabase
                 .from('workflows')
                 .select('*')
@@ -1081,6 +1103,8 @@
         }
         
         async function loadTechnicians() {
+            if (!supabase) return;
+            
             const { data } = await supabase
                 .from('technicians')
                 .select('*')
@@ -1096,6 +1120,8 @@
         }
         
         async function loadStepThresholds() {
+            if (!supabase) return;
+            
             const { data } = await supabase
                 .from('step_thresholds')
                 .select('*')
@@ -1110,6 +1136,8 @@
         }
         
         async function loadTagDefinitions() {
+            if (!supabase) return;
+            
             const { data } = await supabase
                 .from('tag_definitions')
                 .select('*')
