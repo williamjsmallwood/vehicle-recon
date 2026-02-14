@@ -1488,17 +1488,33 @@
 
         // Initialize technician status
         function initTechnicianStatus() {
-            Object.entries(technicians).forEach(([step, techs]) => {
-                techs.forEach(tech => {
-                    if (!technicianStatus[tech]) {
-                        technicianStatus[tech] = {
+            // Handle both old format (object by step) and new format (array of tech objects)
+            if (Array.isArray(technicians)) {
+                // New format from Supabase
+                technicians.forEach(tech => {
+                    const techName = tech.name || tech;
+                    if (!technicianStatus[techName]) {
+                        technicianStatus[techName] = {
                             currentVehicle: null,
                             available: true,
                             lastCompleted: null
                         };
                     }
                 });
-            });
+            } else {
+                // Old format (object by step)
+                Object.entries(technicians).forEach(([step, techs]) => {
+                    techs.forEach(tech => {
+                        if (!technicianStatus[tech]) {
+                            technicianStatus[tech] = {
+                                currentVehicle: null,
+                                available: true,
+                                lastCompleted: null
+                            };
+                        }
+                    });
+                });
+            }
             
             // Set current assignments based on vehicles
             vehicles.forEach(v => {
