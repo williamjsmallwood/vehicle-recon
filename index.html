@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Vehicle Recon Management System</title>
-    <script src="https://cdn.jsdelivr.net/npm/@supabaseClient/supabaseClient-js@2"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <style>
         * {
             margin: 0;
@@ -954,36 +954,40 @@
 
     <script>
         // ============================================
-        // supabaseClient CONFIGURATION
+        // SUPABASE CONFIGURATION
         // ============================================
-        // IMPORTANT: Replace these with your actual supabaseClient credentials
-        // Get these from: supabaseClient Dashboard → Settings → API
-        const supabaseClient_URL = 'https://fpmpujyjhkxtyvwuqwbt.supabaseClient.co';
-        const supabaseClient_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZwbXB1anlqaGt4dHl2d3Vxd2J0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzEwNjUzMDYsImV4cCI6MjA4NjY0MTMwNn0._BQEQV1L938A2onw5iUn0rhnMgVdblYUsUHqj87cXFY';
+        // Your actual Supabase credentials are here
+        const SUPABASE_URL = 'https://fpmpujyjhkxtyvwuqwbt.supabase.co';
+        const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZwbXB1anlqaGt4dHl2d3Vxd2J0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzEwNjUzMDYsImV4cCI6MjA4NjY0MTMwNn0._BQEQV1L938A2onw5iUn0rhnMgVdblYUsUHqj87cXFY';
         
-        // Initialize supabaseClient client (only if credentials are provided)
-        let supabaseClientClient = null;
-        const USE_supabaseClient = supabaseClient_URL !== 'https://fpmpujyjhkxtyvwuqwbt.supabaseClient.co' && supabaseClient_ANON_KEY !== 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZwbXB1anlqaGt4dHl2d3Vxd2J0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzEwNjUzMDYsImV4cCI6MjA4NjY0MTMwNn0._BQEQV1L938A2onw5iUn0rhnMgVdblYUsUHqj87cXFY';
+        // Initialize Supabase client
+        let supabase = null;
+        const USE_SUPABASE = SUPABASE_URL && SUPABASE_ANON_KEY;
         
-        if (USE_supabaseClient && window.supabaseClient) {
+        if (USE_SUPABASE && typeof window.supabase !== 'undefined') {
             try {
-                supabaseClientClient = window.supabaseClient.createClient(supabaseClient_URL, supabaseClient_ANON_KEY);
+                supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+                console.log('✅ Supabase initialized');
             } catch (error) {
-                console.error('Failed to initialize supabaseClient:', error);
+                console.error('❌ Failed to initialize Supabase:', error);
             }
+        } else {
+            console.log('⚠️ Using mock authentication (Supabase not configured)');
         }
 
         
-        // User session
+        // User session and location
         let userSession = null;
         let userLocation = null;
+        let userLocations = []; // Array of locations super admin can access
+        let currentLocationId = null; // Currently selected location
         
         // ============================================
         // AUTHENTICATION FUNCTIONS
         // ============================================
         
         async function initializeAuth() {
-            if (!USE_supabaseClient || !supabaseClient) {
+            if (!USE_SUPABASE || !supabaseClient) {
                 // Fallback to mock login if supabaseClient not configured
                 return;
             }
