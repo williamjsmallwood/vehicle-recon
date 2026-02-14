@@ -961,12 +961,12 @@
         const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZwbXB1anlqaGt4dHl2d3Vxd2J0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzEwNjUzMDYsImV4cCI6MjA4NjY0MTMwNn0._BQEQV1L938A2onw5iUn0rhnMgVdblYUsUHqj87cXFY';
         
         // Initialize Supabase client
-        let supabase = null;
+        let supabaseClient = null;
         const USE_SUPABASE = SUPABASE_URL && SUPABASE_ANON_KEY;
         
         if (USE_SUPABASE && typeof window.supabase !== 'undefined') {
             try {
-                supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+                supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
                 console.log('✅ Supabase initialized');
             } catch (error) {
                 console.error('❌ Failed to initialize Supabase:', error);
@@ -2983,7 +2983,7 @@
         // ============================================
         
         async function loadUserProfileFromSupabase(userId) {
-            if (!supabase) return;
+            if (!supabaseClient) return;
             
             try {
                 // Load user profile
@@ -3196,10 +3196,10 @@
             const password = document.getElementById('password').value;
             
             // Try Supabase first if configured
-            if (USE_SUPABASE && supabase) {
+            if (USE_SUPABASE && supabaseClient) {
                 try {
                     console.log('🔐 Attempting Supabase login...');
-                    const { data, error } = await supabase.auth.signInWithPassword({
+                    const { data, error } = await supabaseClient.auth.signInWithPassword({
                         email: email,
                         password: password
                     });
@@ -3238,8 +3238,8 @@
         }
 
         async function logout() {
-            if (USE_SUPABASE && supabase) {
-                await supabase.auth.signOut();
+            if (USE_SUPABASE && supabaseClient) {
+                await supabaseClient.auth.signOut();
             }
             currentUser = null;
             userLocations = [];
@@ -5133,8 +5133,8 @@ ${baseDirectory}/
 
         // Initialize - check for existing session
         async function init() {
-            if (USE_SUPABASE && supabase) {
-                const { data: { session } } = await supabase.auth.getSession();
+            if (USE_SUPABASE && supabaseClient) {
+                const { data: { session } } = await supabaseClient.auth.getSession();
                 if (session) {
                     console.log('📌 Existing session found');
                     await loadUserProfileFromSupabase(session.user.id);
