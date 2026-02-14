@@ -2990,7 +2990,7 @@
             
             try {
                 // Load user profile
-                const { data: profile, error: profileError } = await supabase
+                const { data: profile, error: profileError } = await supabaseClient
                     .from('user_profiles')
                     .select('*')
                     .eq('id', userId)
@@ -3018,7 +3018,7 @@
                     await loadAllLocationsForSuperAdmin();
                 } else {
                     // Regular user - load their single location
-                    const { data: location, error: locError } = await supabase
+                    const { data: location, error: locError } = await supabaseClient
                         .from('locations')
                         .select('*')
                         .eq('id', profile.location_id)
@@ -3041,7 +3041,7 @@
         }
         
         async function loadAllLocationsForSuperAdmin() {
-            const { data: locations, error } = await supabase
+            const { data: locations, error } = await supabaseClient
                 .from('locations')
                 .select('*')
                 .order('name');
@@ -3063,7 +3063,7 @@
             
             try {
                 // Load vehicles
-                const { data: vehicleData, error: vError } = await supabase
+                const { data: vehicleData, error: vError } = await supabaseClient
                     .from('vehicles')
                     .select('*')
                     .eq('location_id', currentLocationId);
@@ -3094,7 +3094,7 @@
                     
                     // Load notes for each vehicle
                     for (let vehicle of vehicles) {
-                        const { data: notes } = await supabase
+                        const { data: notes } = await supabaseClient
                             .from('vehicle_notes')
                             .select('*')
                             .eq('vehicle_id', vehicle.id)
@@ -3114,7 +3114,7 @@
                 }
                 
                 // Load workflows
-                const { data: workflowData } = await supabase
+                const { data: workflowData } = await supabaseClient
                     .from('workflows')
                     .select('*')
                     .eq('location_id', currentLocationId);
@@ -3132,7 +3132,7 @@
                 }
                 
                 // Load technicians
-                const { data: techData } = await supabase
+                const { data: techData } = await supabaseClient
                     .from('technicians')
                     .select('*')
                     .eq('location_id', currentLocationId);
@@ -3147,7 +3147,7 @@
                 }
                 
                 // Load step thresholds
-                const { data: thresholdData } = await supabase
+                const { data: thresholdData } = await supabaseClient
                     .from('step_thresholds')
                     .select('*')
                     .eq('location_id', currentLocationId);
@@ -3161,7 +3161,7 @@
                 }
                 
                 // Load tag definitions
-                const { data: tagData } = await supabase
+                const { data: tagData } = await supabaseClient
                     .from('tag_definitions')
                     .select('*')
                     .eq('location_id', currentLocationId);
