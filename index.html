@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Vehicle Recon Management System</title>
-    <script src="https://cdn.jsdelivr.net/npm/@supabaseClient/supabaseClient-js@2"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <style>
         * {
             margin: 0;
@@ -954,25 +954,24 @@
 
     <script>
         // ============================================
-        // supabaseClient CONFIGURATION
+        // SUPABASE CONFIGURATION
         // ============================================
-        // IMPORTANT: Replace these with your actual supabaseClient credentials
-        // Get these from: supabaseClient Dashboard → Settings → API
-        const supabaseClient_URL = 'https://fpmpujyjhkxtyvwuqwbt.supabaseClient.co';
-        const supabaseClient_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZwbXB1anlqaGt4dHl2d3Vxd2J0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzEwNjUzMDYsImV4cCI6MjA4NjY0MTMwNn0._BQEQV1L938A2onw5iUn0rhnMgVdblYUsUHqj87cXFY';
+        // IMPORTANT: Replace these with your actual Supabase credentials
+        // Get these from: Supabase Dashboard → Settings → API
+        const SUPABASE_URL = 'https://fpmpujyjhkxtyvwuqwbt.supabase.co';
+        const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZwbXB1anlqaGt4dHl2d3Vxd2J0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzEwNjUzMDYsImV4cCI6MjA4NjY0MTMwNn0._BQEQV1L938A2onw5iUn0rhnMgVdblYUsUHqj87cXFY';
         
-        // Initialize supabaseClient client (only if credentials are provided)
-        let supabaseClientClient = null;
-        const USE_supabaseClient = supabaseClient_URL !== 'https://fpmpujyjhkxtyvwuqwbt.supabaseClient.co' && supabaseClient_ANON_KEY !== 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZwbXB1anlqaGt4dHl2d3Vxd2J0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzEwNjUzMDYsImV4cCI6MjA4NjY0MTMwNn0._BQEQV1L938A2onw5iUn0rhnMgVdblYUsUHqj87cXFY';
+        // Initialize Supabase client (only if credentials are provided)
+        let supabase = null;
+        const USE_SUPABASE = SUPABASE_URL !== 'YOUR_SUPABASE_URL_HERE' && SUPABASE_ANON_KEY !== 'YOUR_SUPABASE_ANON_KEY_HERE';
         
-        if (USE_supabaseClient && window.supabaseClient) {
+        if (USE_SUPABASE && window.supabase) {
             try {
-                supabaseClientClient = window.supabaseClient.createClient(supabaseClient_URL, supabaseClient_ANON_KEY);
+                supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
             } catch (error) {
-                console.error('Failed to initialize supabaseClient:', error);
+                console.error('Failed to initialize Supabase:', error);
             }
         }
-
         
         // User session
         let userSession = null;
@@ -983,21 +982,21 @@
         // ============================================
         
         async function initializeAuth() {
-            if (!USE_supabaseClient || !supabaseClient) {
-                // Fallback to mock login if supabaseClient not configured
+            if (!USE_SUPABASE || !supabase) {
+                // Fallback to mock login if Supabase not configured
                 return;
             }
             
-            const { data: { session } } = await supabaseClient.auth.getSession();
+            const { data: { session } } = await supabase.auth.getSession();
             if (session) {
                 await loadUserProfile(session.user.id);
             }
         }
         
         async function loadUserProfile(userId) {
-            if (!supabaseClient) return;
+            if (!supabase) return;
             
-            const { data, error } = await supabaseClient
+            const { data, error } = await supabase
                 .from('user_profiles')
                 .select(`
                     *,
@@ -1024,7 +1023,7 @@
         // ============================================
         
         async function loadAllData() {
-            if (!userLocation || !supabaseClient) return;
+            if (!userLocation || !supabase) return;
             
             await Promise.all([
                 loadVehicles(),
@@ -1036,9 +1035,9 @@
         }
         
         async function loadVehicles() {
-            if (!supabaseClient) return;
+            if (!supabase) return;
             
-            const { data, error } = await supabaseClient
+            const { data, error } = await supabase
                 .from('vehicles')
                 .select('*')
                 .eq('location_id', userLocation.id);
@@ -1065,9 +1064,9 @@
         }
         
         async function loadVehicleNotes(vehicle) {
-            if (!supabaseClient) return;
+            if (!supabase) return;
             
-            const { data } = await supabaseClient
+            const { data } = await supabase
                 .from('vehicle_notes')
                 .select('*')
                 .eq('vehicle_id', vehicle.id)
@@ -1084,9 +1083,9 @@
         }
         
         async function loadWorkflows() {
-            if (!supabaseClient) return;
+            if (!supabase) return;
             
-            const { data } = await supabaseClient
+            const { data } = await supabase
                 .from('workflows')
                 .select('*')
                 .eq('location_id', userLocation.id);
@@ -1104,9 +1103,9 @@
         }
         
         async function loadTechnicians() {
-            if (!supabaseClient) return;
+            if (!supabase) return;
             
-            const { data } = await supabaseClient
+            const { data } = await supabase
                 .from('technicians')
                 .select('*')
                 .eq('location_id', userLocation.id);
@@ -1121,9 +1120,9 @@
         }
         
         async function loadStepThresholds() {
-            if (!supabaseClient) return;
+            if (!supabase) return;
             
-            const { data } = await supabaseClient
+            const { data } = await supabase
                 .from('step_thresholds')
                 .select('*')
                 .eq('location_id', userLocation.id);
@@ -1137,9 +1136,9 @@
         }
         
         async function loadTagDefinitions() {
-            if (!supabaseClient) return;
+            if (!supabase) return;
             
-            const { data } = await supabaseClient
+            const { data } = await supabase
                 .from('tag_definitions')
                 .select('*')
                 .eq('location_id', userLocation.id);
@@ -1883,8 +1882,8 @@
                     </div>
                     
                     <div class="form-group">
-                       <label>Email</label>
-                       <input type="text" id="username" placeholder="Enter email (e.g., admin@miami.test)">
+                        <label>Username</label>
+                        <input type="text" id="username" placeholder="Enter username">
                     </div>
                     <div class="form-group">
                         <label>Password</label>
@@ -1896,11 +1895,6 @@
                         Admin: admin / admin123<br>
                         Tech: mike / tech123<br>
                         Tech: sarah / tech123
-                        <strong>Test Accounts:</strong><br>
-                        Miami Admin: admin@miami.test / Password123!<br>
-                        Miami Tech: tech.mike@miami.test / Password123!<br>
-                        FTL Admin: admin@ftl.test / Password123!<br>
-                        WPB Admin: admin@wpb.test / Password123!
                     </div>
                 </div>
             `;
@@ -2966,54 +2960,27 @@
         }
 
         // Event Handlers
-       async function login() {
-    const email = document.getElementById('username').value;
-    const password = document.getElementById('password').value;
-    
-    if (USE_SUPABASE && supabase) {
-        try {
-            const { data, error } = await supabase.auth.signInWithPassword({
-                email: email,
-                password: password
-            });
+        function login() {
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
             
-            if (error) {
-                alert('Invalid credentials: ' + error.message);
-                return;
-            }
-            
-            if (data.user) {
-                await loadUserProfile(data.user.id);
+            if (users[username] && users[username].password === password) {
+                currentUser = {
+                    username: username,
+                    ...users[username]
+                };
                 currentView = currentUser.role === 'technician' ? 'technician' : 'dashboard';
                 render();
+            } else {
+                alert('Invalid credentials');
             }
-        } catch (err) {
-            alert('Login error: ' + err.message);
         }
-    } else {
-        const username = email;
-        if (users[username] && users[username].password === password) {
-            currentUser = {
-                username: username,
-                ...users[username]
-            };
-            currentView = currentUser.role === 'technician' ? 'technician' : 'dashboard';
-            render();
-        } else {
-            alert('Invalid credentials');
-        }
-    }
-}
 
-       async function logout() {
-    if (USE_SUPABASE && supabase) {
-        await supabase.auth.signOut();
-    }
-    currentUser = null;
-    userLocation = null;
-    currentView = 'dashboard';
-    render();
-}
+        function logout() {
+            currentUser = null;
+            currentView = 'dashboard';
+            render();
+        }
 
         function switchView(view) {
             currentView = view;
@@ -4898,13 +4865,9 @@ ${baseDirectory}/
         window.clearAllData = clearAllData;
         window.exportData = exportData;
 
-        // Initialize - Check for existing session, then render
-        async function init() {
-        await initializeAuth();
+        // Initialize - Just render with sample data
+        // User must load their save file manually
         render();
-    }
-
-    init();
     </script>
 </body>
 </html>
