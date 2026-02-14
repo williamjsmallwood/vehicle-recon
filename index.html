@@ -964,16 +964,19 @@
         let supabaseClient = null;
         const USE_SUPABASE = SUPABASE_URL && SUPABASE_ANON_KEY;
         
-        if (USE_SUPABASE && typeof window.supabase !== 'undefined') {
-            try {
-                supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-                console.log('✅ Supabase initialized');
-            } catch (error) {
-                console.error('❌ Failed to initialize Supabase:', error);
+        // Wait for page to load before initializing
+        document.addEventListener('DOMContentLoaded', function() {
+            if (USE_SUPABASE && typeof window.supabase !== 'undefined') {
+                try {
+                    supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+                    console.log('✅ Supabase initialized');
+                } catch (error) {
+                    console.error('❌ Failed to initialize Supabase:', error);
+                }
+            } else {
+                console.log('⚠️ Using mock authentication (Supabase not configured)');
             }
-        } else {
-            console.log('⚠️ Using mock authentication (Supabase not configured)');
-        }
+        });
 
         
         // User session and location
