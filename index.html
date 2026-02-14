@@ -1227,7 +1227,7 @@
         // Sample vehicles with different states
         let vehicles = [
             {
-                vin: '1HGBH41JXMN109186',
+                vin: ,
                 stockNumber: 'A12345',
                 year: '2021',
                 make: 'Honda',
@@ -1255,7 +1255,7 @@
                 workflow: 'CPO'
             },
             {
-                vin: '2FMDK3GC8MBA12345',
+                vin: ,
                 stockNumber: 'B98765',
                 year: '2022',
                 make: 'Ford',
@@ -1905,14 +1905,26 @@
             return `
                 <header>
                     <h1>🚗 Vehicle Recon Management System</h1>
-                    <div class="user-info">
-                        <span>${currentUser.name}</span>
-                        <span class="role-badge">${currentUser.role}</span>
-                        ${currentUser.role === 'administrator' ? `
-                            <button class="btn" onclick="saveChanges()" style="background: #48bb78; padding: 6px 12px; font-size: 14px;">
-                                💾 Save to File
-                            </button>
-                        ` : ''}
+                   <div class="user-info">
+    <span>👤 ${currentUser.name || currentUser.username}</span>
+    <span>Role: ${currentUser.role}</span>
+    ${currentUser.department ? `<span>Dept: ${currentUser.department}</span>` : ''}
+    
+    ${currentUser && currentUser.role === 'superadmin' && userLocations.length > 1 ? `
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <label style="font-size: 12px; color: #718096;">Location:</label>
+            <select onchange="switchLocation(this.value)" style="padding: 6px; border: 2px solid #4299e1; border-radius: 4px; font-size: 12px;">
+                ${userLocations.map(loc => `
+                    <option value="${loc.id}" ${loc.id === currentLocationId ? 'selected' : ''}>
+                        ${loc.name}
+                    </option>
+                `).join('')}
+            </select>
+        </div>
+    ` : ''}
+    
+    <button class="btn" onclick="logout()">Logout</button>
+</div>
                         <button class="logout-btn" onclick="logout()">Logout</button>
                     </div>
                 </header>
@@ -1925,6 +1937,8 @@
             const inProgress = vehicles.filter(v => v.currentStep !== 'Finished' && v.workflow && v.workflow !== 'AWAITING').length;
             const completed = vehicles.filter(v => v.currentStep === 'Finished').length;
             const overdue = vehicles.filter(v => isOverdue(v) && v.currentStep !== 'Finished').length;
+
+
             
             // Calculate suggested changes
             const suggested = vehicles.filter(v => {
@@ -2357,8 +2371,8 @@
                             <h3 style="font-size: 16px; margin-bottom: 10px;">Add New User</h3>
                             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
                                 <div class="form-group">
-                                    <label>Username</label>
-                                    <input type="text" id="newUsername" placeholder="username">
+                                    <label>Email / Username</label>
+                                    <input type="text" id="username" placeholder="admin@miami.test or admin">
                                 </div>
                                 <div class="form-group">
                                     <label>Password</label>
@@ -2960,25 +2974,272 @@
             `;
         }
 
+        // ============================================
+        // SUPABASE DATA LOADING FUNCTIONS
+        // ============================================
+        
+        async function loadUserProfileFromSupabase(userId) {
+            if (!supabase) return;
+            
+            try {
+                // Load user profile
+                const { data: profile, error: profileError } = await supabase
+                    .from('user_profiles')
+                    .select('*')
+                    .eq('id', userId)
+                    .single();
+                
+                if (profileError) {
+                    console.error('Profile load error:', profileError);
+                    alert('Error loading profile: ' + profileError.message);
+                    return;
+                }
+                
+                console.log('👤 Profile loaded:', profile);
+                
+                // Set current user
+                currentUser = {
+                    username: profile.username,
+                    role: profile.role,
+                    name: profile.full_name,
+                    department: profile.department
+                };
+                
+                // Handle super admin (can see all locations)
+                if (profile.role === 'superadmin') {
+                    console.log('🌟 Super admin detected - loading all locations');
+                    await loadAllLocationsForSuperAdmin();
+                } else {
+                    // Regular user - load their single location
+                    const { data: location, error: locError } = await supabase
+                        .from('locations')
+                        .select('*')
+                        .eq('id', profile.location_id)
+                        .single();
+                    
+                    if (location) {
+                        userLocations = [location];
+                        currentLocationId = location.id;
+                        console.log('📍 Location loaded:', location.name);
+                    }
+                }
+                
+                // Load data for current location
+                await loadDataFromSupabase();
+                
+            } catch (err) {
+                console.error('Profile load exception:', err);
+                alert('Error: ' + err.message);
+            }
+        }
+        
+        async function loadAllLocationsForSuperAdmin() {
+            const { data: locations, error } = await supabase
+                .from('locations')
+                .select('*')
+                .order('name');
+            
+            if (locations && locations.length > 0) {
+                userLocations = locations;
+                currentLocationId = locations[0].id; // Default to first location
+                console.log(`✅ Loaded ${locations.length} locations`);
+            }
+        }
+        
+        async function loadDataFromSupabase() {
+            if (!supabase || !currentLocationId) {
+                console.log('⚠️ Skipping data load - no location selected');
+                return;
+            }
+            
+            console.log('📊 Loading data for location:', currentLocationId);
+            
+            try {
+                // Load vehicles
+                const { data: vehicleData, error: vError } = await supabase
+                    .from('vehicles')
+                    .select('*')
+                    .eq('location_id', currentLocationId);
+                
+                if (vehicleData) {
+                    vehicles = vehicleData.map(v => ({
+                        id: v.id,
+                        vin: v.vin,
+                        stockNumber: v.stock_number,
+                        year: v.year,
+                        make: v.make,
+                        model: v.model,
+                        miles: v.miles,
+                        appraisalNotes: v.appraisal_notes,
+                        currentStep: v.current_step,
+                        workflow: v.workflow,
+                        assignedTech: v.assigned_tech,
+                        entryTime: new Date(v.entry_time),
+                        stepStartTime: new Date(v.step_start_time),
+                        completedSteps: v.completed_steps || [],
+                        skippedSteps: v.skipped_steps || [],
+                        tags: v.tags || [],
+                        vehicleTags: v.vehicle_tags || [],
+                        photos: v.photos || [],
+                        stepHistory: v.step_history || [],
+                        noteHistory: []
+                    }));
+                    
+                    // Load notes for each vehicle
+                    for (let vehicle of vehicles) {
+                        const { data: notes } = await supabase
+                            .from('vehicle_notes')
+                            .select('*')
+                            .eq('vehicle_id', vehicle.id)
+                            .order('created_at', { ascending: false });
+                        
+                        if (notes) {
+                            vehicle.noteHistory = notes.map(n => ({
+                                text: n.note_text,
+                                timestamp: new Date(n.created_at),
+                                user: n.username,
+                                id: n.id
+                            }));
+                        }
+                    }
+                    
+                    console.log(`✅ Loaded ${vehicles.length} vehicles`);
+                }
+                
+                // Load workflows
+                const { data: workflowData } = await supabase
+                    .from('workflows')
+                    .select('*')
+                    .eq('location_id', currentLocationId);
+                
+                if (workflowData) {
+                    workflows = {};
+                    workflowData.forEach(w => {
+                        workflows[w.workflow_key] = {
+                            name: w.name,
+                            steps: w.steps || [],
+                            color: w.color
+                        };
+                    });
+                    console.log(`✅ Loaded ${workflowData.length} workflows`);
+                }
+                
+                // Load technicians
+                const { data: techData } = await supabase
+                    .from('technicians')
+                    .select('*')
+                    .eq('location_id', currentLocationId);
+                
+                if (techData) {
+                    technicians = techData.map(t => ({
+                        name: t.name,
+                        department: t.department,
+                        status: t.status || 'available'
+                    }));
+                    console.log(`✅ Loaded ${technicians.length} technicians`);
+                }
+                
+                // Load step thresholds
+                const { data: thresholdData } = await supabase
+                    .from('step_thresholds')
+                    .select('*')
+                    .eq('location_id', currentLocationId);
+                
+                if (thresholdData) {
+                    stepThresholds = {};
+                    thresholdData.forEach(t => {
+                        stepThresholds[t.step_name] = t.threshold_hours;
+                    });
+                    console.log(`✅ Loaded step thresholds`);
+                }
+                
+                // Load tag definitions
+                const { data: tagData } = await supabase
+                    .from('tag_definitions')
+                    .select('*')
+                    .eq('location_id', currentLocationId);
+                
+                if (tagData) {
+                    tagDefinitions = {};
+                    tagData.forEach(t => {
+                        tagDefinitions[t.tag_name] = {
+                            color: t.color,
+                            skipsStep: t.skips_step
+                        };
+                    });
+                    console.log(`✅ Loaded ${tagData.length} tag definitions`);
+                }
+                
+            } catch (err) {
+                console.error('Error loading data:', err);
+            }
+        }
+        
+        async function switchLocation(locationId) {
+            if (!currentUser || currentUser.role !== 'superadmin') {
+                alert('Only super admin can switch locations');
+                return;
+            }
+            
+            currentLocationId = locationId;
+            await loadDataFromSupabase();
+            render();
+        }
+        
         // Event Handlers
-        function login() {
-            const username = document.getElementById('username').value;
+        async function login() {
+            const email = document.getElementById('username').value;
             const password = document.getElementById('password').value;
             
-            if (users[username] && users[username].password === password) {
-                currentUser = {
-                    username: username,
-                    ...users[username]
-                };
-                currentView = currentUser.role === 'technician' ? 'technician' : 'dashboard';
-                render();
+            // Try Supabase first if configured
+            if (USE_SUPABASE && supabase) {
+                try {
+                    console.log('🔐 Attempting Supabase login...');
+                    const { data, error } = await supabase.auth.signInWithPassword({
+                        email: email,
+                        password: password
+                    });
+                    
+                    if (error) {
+                        console.error('Auth error:', error);
+                        alert('Invalid credentials: ' + error.message);
+                        return;
+                    }
+                    
+                    console.log('✅ Auth successful');
+                    
+                    if (data.user) {
+                        await loadUserProfileFromSupabase(data.user.id);
+                        currentView = currentUser.role === 'technician' ? 'technician' : 'dashboard';
+                        render();
+                    }
+                } catch (err) {
+                    console.error('Login exception:', err);
+                    alert('Login error: ' + err.message);
+                }
             } else {
-                alert('Invalid credentials');
+                // Fallback to mock authentication
+                const username = email;
+                if (users[username] && users[username].password === password) {
+                    currentUser = {
+                        username: username,
+                        ...users[username]
+                    };
+                    currentView = currentUser.role === 'technician' ? 'technician' : 'dashboard';
+                    render();
+                } else {
+                    alert('Invalid credentials');
+                }
             }
         }
 
-        function logout() {
+        async function logout() {
+            if (USE_SUPABASE && supabase) {
+                await supabase.auth.signOut();
+            }
             currentUser = null;
+            userLocations = [];
+            currentLocationId = null;
             currentView = 'dashboard';
             render();
         }
@@ -4866,9 +5127,19 @@ ${baseDirectory}/
         window.clearAllData = clearAllData;
         window.exportData = exportData;
 
-        // Initialize - Just render with sample data
-        // User must load their save file manually
-        render();
+        // Initialize - check for existing session
+        async function init() {
+            if (USE_SUPABASE && supabase) {
+                const { data: { session } } = await supabase.auth.getSession();
+                if (session) {
+                    console.log('📌 Existing session found');
+                    await loadUserProfileFromSupabase(session.user.id);
+                }
+            }
+            render();
+        }
+        
+        init();
     </script>
 </body>
 </html>
