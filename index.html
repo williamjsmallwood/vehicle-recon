@@ -157,19 +157,23 @@
             margin-bottom: 15px;
         }
         
-        /* Force 3 columns max when filtering to a single step */
+        /* Single-step filtered view: one full-width column, cards inside form a grid */
         .queue-board.single-step {
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: 1fr;
         }
-        
-        @media (max-width: 900px) {
-            .queue-board.single-step {
-                grid-template-columns: repeat(2, 1fr);
-            }
+
+        .queue-board.single-step .queue-column {
+            width: 100%;
         }
-        
+
+        .queue-board.single-step .vehicle-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            gap: 10px;
+        }
+
         @media (max-width: 600px) {
-            .queue-board.single-step {
+            .queue-board.single-step .vehicle-grid {
                 grid-template-columns: 1fr;
             }
         }
@@ -2192,6 +2196,7 @@
                                     ⚠️ ${overdueVehicles.length} OVERDUE!
                                 </div>
                             ` : ''}
+                            <div class="${selectedStepFilter !== 'all' ? 'vehicle-grid' : ''}">
                             ${stepVehicles
                                 .sort((a, b) => a.entryTime - b.entryTime) // Oldest first
                                 .map(vehicle => {
@@ -2264,6 +2269,7 @@
                                         ` : ''}
                                     </div>
                                 `}).join('')}
+                            </div>
                             ${stepVehicles.length === 0 ? '<div style="color: #a0aec0; text-align: center; padding: 20px;">No vehicles</div>' : ''}
                         </div>
                     `}).join('')}
@@ -5523,7 +5529,27 @@ ${baseDirectory}/
                             <div><strong>VIN:</strong> ${vehicle.vin}</div>
                             <div><strong>Stock #:</strong> ${vehicle.stockNumber || 'N/A'}</div>
                             <div><strong>Miles:</strong> ${vehicle.miles?.toLocaleString() || 'N/A'}</div>
-                            <div><strong>Current Step:</strong> ${vehicle.currentStep}</div>
+                            <div style="grid-column: span 2; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                                <strong>Move to Step:</strong>
+                                <select id="quickMoveSelect_${vehicle.vin}"
+                                    style="flex:1; min-width:140px; padding:4px 8px; border:2px solid #4299e1; border-radius:5px; font-size:12px; font-weight:600; color:#2d3748; cursor:pointer;"
+                                    onchange="quickMoveFromHeader('${vehicle.vin}', this)">
+                                    <option value="${vehicle.currentStep}" selected>
+                                        📍 ${vehicle.currentStep}
+                                    </option>
+                                    ${STEPS.filter(s => s !== vehicle.currentStep).map(s => {
+                                        // Determine if step is allowed
+                                        const preReqsMet = s !== 'Quality Control' || STEPS.filter(st =>
+                                            st !== 'Quality Control' && st !== 'Finished'
+                                        ).every(st =>
+                                            vehicle.completedSteps.includes(st) || vehicle.skippedSteps.includes(st)
+                                        );
+                                        const disabled = !preReqsMet ? 'disabled' : '';
+                                        const label = !preReqsMet ? s + ' 🔒' : s;
+                                        return '<option value="' + s + '" ' + disabled + '>' + label + '</option>';
+                                    }).join('')}
+                                </select>
+                            </div>
                             <div><strong>Time in Step:</strong> ${formatTimeDiff(vehicle.stepStartTime)}</div>
                             <div><strong>Total Time:</strong> ${formatTimeDiff(vehicle.entryTime)}</div>
                             <div><strong>Assigned Tech:</strong> ${vehicle.assignedTech}</div>
@@ -5843,6 +5869,41 @@ ${baseDirectory}/
             if (selectedBtn) selectedBtn.classList.add('active');
         }
         
+        async function quickMoveFromHeader(vin, selectEl) {
+            const newStep = selectEl.value;
+            const vehicle = vehicles.find(v => v.vin === vin);
+            if (!vehicle || newStep === vehicle.currentStep) return;
+
+            // QC guard — all prior steps must be complete
+            if (newStep === 'Quality Control') {
+                const allDone = STEPS.filter(s => s !== 'Quality Control' && s !== 'Finished')
+                    .every(s => vehicle.completedSteps.includes(s) || vehicle.skippedSteps.includes(s));
+                if (!allDone) {
+                    alert('❌ Cannot move to Quality Control — all prior steps must be completed first.');
+                    selectEl.value = vehicle.currentStep;
+                    return;
+                }
+            }
+
+            const oldStep = vehicle.currentStep;
+            vehicle.currentStep = newStep;
+            vehicle.stepStartTime = new Date();
+            vehicle.assignedTech = assignTechnician(newStep);
+
+            if (!vehicle.noteHistory) vehicle.noteHistory = [];
+            vehicle.noteHistory.push({
+                text: 'Manually moved from ' + oldStep + ' to ' + newStep,
+                timestamp: new Date(),
+                user: currentUser ? currentUser.username : 'Unknown',
+                id: Date.now() + Math.random()
+            });
+
+            await persistVehicleState(vehicle);
+            closeDialog();
+            render();
+            alert('✓ ' + (vehicle.stockNumber || vin) + ' moved to ' + newStep);
+        }
+
         async function moveVehicleToStepFromDialog(vin) {
             const newStep = document.getElementById(`moveToStep_${vin}`).value;
             const vehicle = vehicles.find(v => v.vin === vin);
