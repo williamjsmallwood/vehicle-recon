@@ -700,6 +700,11 @@
             animation: flash 1.5s infinite;
         }
 
+
+        @keyframes flashOrange {
+            0%, 100% { background: #f39c12; box-shadow: 0 4px 12px rgba(243,156,18,0.4); }
+            50% { background: #e67e22; box-shadow: 0 4px 20px rgba(243,156,18,0.7); }
+        }
         @keyframes flash {
             0%, 100% {
                 opacity: 1;
@@ -872,6 +877,12 @@
             text-align: center;
         }
 
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .login-spinner { display: none; flex-direction: column; align-items: center; gap: 14px; padding: 16px 0 4px; }
+        .login-spinner.active { display: flex; }
+        .spinner-ring { width: 44px; height: 44px; border: 4px solid #e2e8f0; border-top-color: #4299e1; border-radius: 50%; animation: spin 0.8s linear infinite; }
+        .spinner-msg { font-size: 14px; color: #718096; font-weight: 500; }
+
         @media (max-width: 768px) {
             h1 {
                 font-size: 18px;
@@ -1015,6 +1026,7 @@
             
             if (data) {
                 currentUser = {
+                    id: data.id,
                     username: data.username,
                     role: data.role,
                     name: data.full_name,
@@ -1064,9 +1076,32 @@
                     noteHistory: []
                 }));
                 
-                // Load notes for each vehicle
-                for (let vehicle of vehicles) {
-                    await loadVehicleNotes(vehicle);
+                // Load all notes in a single query (fixes N+1 performance issue)
+                if (vehicles.length > 0) {
+                    const vehicleIds = vehicles.map(v => v.id);
+                    const { data: allNotes } = await supabaseClient
+                        .from('vehicle_notes')
+                        .select('*')
+                        .in('vehicle_id', vehicleIds)
+                        .order('created_at', { ascending: false });
+                    
+                    if (allNotes) {
+                        // Group notes by vehicle_id
+                        const notesByVehicle = {};
+                        for (const n of allNotes) {
+                            if (!notesByVehicle[n.vehicle_id]) notesByVehicle[n.vehicle_id] = [];
+                            notesByVehicle[n.vehicle_id].push({
+                                text: n.note_text,
+                                timestamp: new Date(n.created_at),
+                                user: n.username,
+                                id: n.id
+                            });
+                        }
+                        // Assign notes to each vehicle
+                        for (const vehicle of vehicles) {
+                            vehicle.noteHistory = notesByVehicle[vehicle.id] || [];
+                        }
+                    }
                 }
             }
         }
@@ -1623,6 +1658,10 @@
         };
 
         // Utility Functions
+        function isAdmin() {
+            return currentUser && (currentUser.role === 'administrator' || currentUser.role === 'superadmin');
+        }
+        
         function formatTimeDiff(date) {
             const diff = Date.now() - date.getTime();
             const hours = Math.floor(diff / (1000 * 60 * 60));
@@ -1819,9 +1858,29 @@
                 vehicle.currentStep = newStep;
                 vehicle.stepStartTime = new Date();
                 vehicle.assignedTech = assignTechnician(newStep);
-                
+
+                persistVehicleState(vehicle);
                 render();
                 alert(`✓ Vehicle ${vehicle.stockNumber || vin} moved to ${newStep}`);
+            }
+        }
+
+        // ── Persist vehicle state to Supabase after any step change ──
+        async function persistVehicleState(vehicle) {
+            if (!supabaseClient || !vehicle.id) return;
+            try {
+                await supabaseClient.from('vehicles').update({
+                    current_step:     vehicle.currentStep,
+                    step_start_time:  vehicle.stepStartTime instanceof Date
+                                        ? vehicle.stepStartTime.toISOString()
+                                        : vehicle.stepStartTime,
+                    assigned_tech:    vehicle.assignedTech,
+                    completed_steps:  vehicle.completedSteps,
+                    skipped_steps:    vehicle.skippedSteps,
+                    workflow:         vehicle.workflow
+                }).eq('id', vehicle.id);
+            } catch (e) {
+                console.warn('persistVehicleState failed:', e.message);
             }
         }
 
@@ -1870,8 +1929,8 @@
                 technicianStatus[newTech].available = false;
                 technicianStatus[newTech].currentVehicle = vehicle.vin;
             }
-            
-            
+
+            persistVehicleState(vehicle);
             render();
         }
 
@@ -1885,8 +1944,8 @@
             vehicle.currentStep = sendBackTo;
             vehicle.stepStartTime = new Date();
             vehicle.assignedTech = assignTechnician(sendBackTo);
-            
-            
+
+            persistVehicleState(vehicle);
             render();
         }
 
@@ -1894,31 +1953,23 @@
         function renderLogin() {
             return `
                 <div class="login-container">
-                    <h2 class="login-title">Vehicle Recon System</h2>
+                    <h2 class="login-title">🚗 Vehicle Recon System</h2>
                     
-                    <div style="background: #e6fffa; border: 2px solid #38b2ac; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
-                        <h3 style="margin-bottom: 8px; color: #234e52; font-size: 14px;">📂 Load Your Save File</h3>
-                        <p style="margin-bottom: 10px; font-size: 12px; color: #2c7a7b;">
-                            If you have a saved data file, load it here before logging in:
-                        </p>
-                        <input type="file" id="loginLoadFile" accept=".json" onchange="loadFromFile(event)" 
-                               style="width: 100%; padding: 8px; border: 2px solid #38b2ac; border-radius: 4px; font-size: 12px; cursor: pointer; background: white;">
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Username</label>
-                        <input type="text" id="username" placeholder="Enter username">
-                    </div>
-                    <div class="form-group">
-                        <label>Password</label>
-                        <input type="password" id="password" placeholder="Enter password">
-                    </div>
-                    <button class="btn" onclick="login()" style="width: 100%">Login</button>
-                    <div style="margin-top: 20px; padding: 15px; background: #f7fafc; border-radius: 4px; font-size: 12px;">
-                        <strong>Demo Accounts:</strong><br>
-                        Admin: admin / admin123<br>
-                        Tech: mike / tech123<br>
-                        Tech: sarah / tech123
+                    <form id="loginForm" onsubmit="event.preventDefault(); login();" style="width: 100%;">
+                        <div class="form-group">
+                            <label>Email / Username</label>
+                            <input type="text" id="username" placeholder="Enter email or username" autofocus>
+                        </div>
+                        <div class="form-group">
+                            <label>Password</label>
+                            <input type="password" id="password" placeholder="Enter password">
+                        </div>
+                        <button type="submit" id="loginBtn" class="btn" style="width: 100%">Login</button>
+                    </form>
+
+                    <div class="login-spinner" id="loginSpinner">
+                        <div class="spinner-ring"></div>
+                        <span class="spinner-msg" id="loginSpinnerMsg">Signing in…</span>
                     </div>
                 </div>
             `;
@@ -1933,20 +1984,29 @@
     <span>Role: ${currentUser.role}</span>
     ${currentUser.department ? `<span>Dept: ${currentUser.department}</span>` : ''}
     
-    ${currentUser && currentUser.role === 'superadmin' && userLocations.length > 1 ? `
+    ${currentUser && currentUser.role === 'superadmin' && userLocations.length > 0 ? `
         <div style="display: flex; align-items: center; gap: 10px;">
-            <label style="font-size: 12px; color: #718096;">Location:</label>
-            <select onchange="switchLocation(this.value)" style="padding: 6px; border: 2px solid #4299e1; border-radius: 4px; font-size: 12px;">
-                ${userLocations.map(loc => `
-                    <option value="${loc.id}" ${loc.id === currentLocationId ? 'selected' : ''}>
-                        ${loc.name}
-                    </option>
-                `).join('')}
-            </select>
+            <label style="font-size: 12px; color: #718096; font-weight: bold;">📍 Viewing:</label>
+            ${userLocations.length > 1 ? `
+                <select id="locationSwitcher" onchange="handleLocationSwitch(this.value)" style="padding: 6px; border: 2px solid #4299e1; border-radius: 4px; font-size: 12px; font-weight: bold;">
+                    ${userLocations.map(loc => `
+                        <option value="${loc.id}" ${loc.id === currentLocationId ? 'selected' : ''}>
+                            ${loc.name}
+                        </option>
+                    `).join('')}
+                </select>
+            ` : `
+                <span style="padding: 6px; background: #e6f7ff; border: 2px solid #4299e1; border-radius: 4px; font-size: 12px; font-weight: bold;">
+                    ${userLocations[0]?.name || 'No Location'}
+                </span>
+            `}
         </div>
-    ` : ''}
+    ` : (userLocations.length > 0 ? `
+        <span style="padding: 6px; background: #f7fafc; border: 2px solid #cbd5e0; border-radius: 4px; font-size: 12px;">
+            📍 ${userLocations[0]?.name || 'Location'}
+        </span>
+    ` : '')}
     
-    <button class="btn" onclick="logout()">Logout</button>
 </div>
                         <button class="logout-btn" onclick="logout()">Logout</button>
                     </div>
@@ -1994,7 +2054,7 @@
                 : [selectedStepFilter];
 
             return `
-                ${currentUser.role === 'administrator' ? `
+                ${isAdmin() ? `
                 <div class="step-filter-bar">
                     <div class="step-filter-buttons">
                         <button class="step-filter-btn ${selectedStepFilter === 'all' ? 'all-steps' : ''}" 
@@ -2006,6 +2066,8 @@
                         </button>
                         ${STEPS.filter(s => s !== 'Finished').map(step => {
                             const stats = getStepStats(step);
+                            // Only show step if it has vehicles in it
+                            if (stats.inStep === 0) return '';
                             return `
                             <button class="step-filter-btn ${selectedStepFilter === step ? 'active' : ''}" 
                                     onclick="filterByStep('${step}')">
@@ -2034,6 +2096,8 @@
                         </button>
                         ${Object.entries(workflows).map(([id, workflow]) => {
                             const count = vehicles.filter(v => v.workflow === id).length;
+                            // Only show workflow if it has vehicles
+                            if (count === 0) return '';
                             return `
                                 <button class="workflow-btn ${currentWorkflowFilter === id ? 'active' : ''}" 
                                         style="border-color: ${workflow.color}; ${currentWorkflowFilter === id ? `background: ${workflow.color}; color: white;` : ''}"
@@ -2073,69 +2137,26 @@
                     </div>
                 </div>
 
-                <!-- Awaiting Arrival Section -->
-                ${selectedStatFilter === 'awaiting' || selectedStatFilter === 'all' || selectedStatFilter === 'total' ? `
-                    <div style="background: #fffbeb; border: 3px solid #f39c12; border-radius: 8px; padding: 20px; margin-bottom: 20px;">
-                        <h3 style="margin-bottom: 15px; font-size: 18px; color: #7c2d12;">
-                            ⏳ Awaiting Arrival
-                        </h3>
-                        ${awaitingArrival > 0 ? `
-                            <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px;">
-                                ${vehicles.filter(v => !v.workflow || v.workflow === 'AWAITING').map(vehicle => `
-                                    <div style="background: white; padding: 15px; border-radius: 6px; border: 2px solid #f39c12; cursor: pointer; transition: all 0.2s;" 
-                                         onclick="showVehicleDetails('${vehicle.vin}')"
-                                         onmouseover="this.style.transform='translateY(-2px)'; this.style.boxShadow='0 4px 8px rgba(0,0,0,0.15)';"
-                                         onmouseout="this.style.transform='translateY(0)'; this.style.boxShadow='none';">
-                                        <div style="font-size: 14px; font-weight: bold; margin-bottom: 8px; color: #2d3748;">
-                                            ${vehicle.year} ${vehicle.make} ${vehicle.model}
-                                        </div>
-                                        <div style="font-size: 12px; color: #718096; margin-bottom: 10px;">
-                                            <div><strong>Stock:</strong> ${vehicle.stockNumber}</div>
-                                            <div><strong>VIN:</strong> ${vehicle.vin}</div>
-                                            <div><strong>Miles:</strong> ${vehicle.miles?.toLocaleString() || 'N/A'}</div>
-                                            ${(vehicle.noteHistory && vehicle.noteHistory.length > 0) ? `
-                                                <div style="margin-top: 6px; padding: 6px; background: #f7fafc; border-radius: 3px; font-size: 11px;">
-                                                    <strong>Latest note:</strong> ${vehicle.noteHistory[vehicle.noteHistory.length - 1].text.substring(0, 50)}${vehicle.noteHistory[vehicle.noteHistory.length - 1].text.length > 50 ? '...' : ''}
-                                                </div>
-                                            ` : ''}
-                                            ${(vehicle.vehicleTags && vehicle.vehicleTags.length > 0) ? `
-                                                <div style="margin-top: 6px;">
-                                                    ${vehicle.vehicleTags.slice(0, 2).map(tag => `
-                                                        <span style="display: inline-block; font-size: 10px; padding: 2px 6px; margin: 2px; background: ${tagDefinitions[tag]?.color || '#bee3f8'}; border-radius: 3px;">${tag}</span>
-                                                    `).join('')}
-                                                    ${vehicle.vehicleTags.length > 2 ? `<span style="font-size: 10px; color: #718096;">+${vehicle.vehicleTags.length - 2}</span>` : ''}
-                                                </div>
-                                            ` : ''}
-                                        </div>
-                                        <div style="margin-bottom: 10px; padding-top: 10px; border-top: 1px solid #e2e8f0;">
-                                            <label style="display: block; margin-bottom: 5px; font-size: 11px; font-weight: bold; color: #4a5568;">Assign Workflow:</label>
-                                            <select id="workflow_${vehicle.vin}" 
-                                                    onclick="event.stopPropagation();"
-                                                    style="width: 100%; padding: 8px; font-size: 12px; border: 2px solid #cbd5e0; border-radius: 4px;">
-                                                <option value="">-- Select Workflow --</option>
-                                                ${Object.entries(workflows).map(([id, workflow]) => `
-                                                    <option value="${id}">${workflow.name}</option>
-                                                `).join('')}
-                                            </select>
-                                        </div>
-                                        <button class="btn" onclick="event.stopPropagation(); assignWorkflowToVehicle('${vehicle.vin}')" 
-                                                style="width: 100%; background: #48bb78; padding: 10px; font-size: 13px;">
-                                            ✅ Assign & Start Recon
-                                        </button>
-                                        <div style="margin-top: 8px; text-align: center; font-size: 11px; color: #718096;">
-                                            Click card to add notes/tags
-                                        </div>
-                                    </div>
-                                `).join('')}
-                            </div>
-                        ` : `
-                            <div style="text-align: center; padding: 30px; color: #718096;">
-                                <div style="font-size: 48px; margin-bottom: 10px;">✓</div>
-                                <div style="font-size: 14px;">No vehicles awaiting assignment</div>
-                            </div>
-                        `}
+                <!-- Awaiting Arrival Button -->
+                ${awaitingArrival > 0 ? `
+                    <div style="margin-bottom: 15px;">
+                        <button onclick="openAwaitingModal()" style="
+                            padding: 12px 24px;
+                            background: #f39c12;
+                            color: white;
+                            border: none;
+                            border-radius: 8px;
+                            font-size: 15px;
+                            font-weight: bold;
+                            cursor: pointer;
+                            animation: flashOrange 1.5s ease-in-out infinite;
+                            box-shadow: 0 4px 12px rgba(243,156,18,0.4);
+                        ">
+                            ⏳ Awaiting Arrival &mdash; ${awaitingArrival} vehicle${awaitingArrival !== 1 ? 's' : ''}
+                        </button>
                     </div>
                 ` : ''}
+
 
                 <div class="queue-board ${selectedStepFilter !== 'all' ? 'single-step' : ''}">
                     ${stepsToShow.map(step => {
@@ -2183,7 +2204,7 @@
                                             </div>
                                             <div style="display: flex; align-items: center; gap: 5px;">
                                                 <span class="progress-indicator">${vehicle.completedSteps.length}/${STEPS.length - 1}</span>
-                                                ${currentUser.role === 'administrator' ? `
+                                                ${isAdmin() ? `
                                                     <span class="lock-icon" 
                                                           onclick="event.stopPropagation(); toggleReassignLock('${vehicle.vin}')" 
                                                           title="${reassignableLocks.has(vehicle.vin) ? 'Locked from auto-reassign' : 'Click to lock from auto-reassign'}">
@@ -2201,7 +2222,7 @@
                                             </div>
                                         ` : ''}
                                         ${vehicleOverdue ? '<div class="vehicle-tags"><span class="tag alert-tag">⚠️ OVERDUE</span></div>' : ''}
-                                        ${currentUser.role === 'administrator' && vehicle.currentStep !== 'Finished' ? `
+                                        ${isAdmin() && vehicle.currentStep !== 'Finished' ? `
                                             <button class="quick-complete-btn" onclick="event.stopPropagation(); quickCompleteStep('${vehicle.vin}')">
                                                 ✓ Complete ${vehicle.currentStep}
                                             </button>
@@ -2231,7 +2252,7 @@
                     `}).join('')}
                 </div>
                 
-                ${currentUser.role === 'administrator' && inProgress > 0 ? `
+                ${isAdmin() && inProgress > 0 ? `
                     <button class="auto-reassign-btn" onclick="autoReassignAll()" title="Auto-optimize all vehicle assignments">
                         🤖 Auto-Reassign All
                     </button>
@@ -2296,11 +2317,17 @@
         function renderAdminPanel() {
             return `
                 <div class="admin-tabs">
+                    <button class="admin-tab ${currentAdminTab === 'dashboard' ? 'active' : ''}" onclick="switchAdminTab('dashboard')">
+                        📊 Dashboard
+                    </button>
+                    <button class="admin-tab ${currentAdminTab === 'usermgmt' ? 'active' : ''}" onclick="switchAdminTab('usermgmt')">
+                        👥 User Management
+                    </button>
                     <button class="admin-tab ${currentAdminTab === 'import' ? 'active' : ''}" onclick="switchAdminTab('import')">
                         📋 Import Vehicles
                     </button>
                     <button class="admin-tab ${currentAdminTab === 'users' ? 'active' : ''}" onclick="switchAdminTab('users')">
-                        👥 Users
+                        👤 Mock Users
                     </button>
                     <button class="admin-tab ${currentAdminTab === 'steps' ? 'active' : ''}" onclick="switchAdminTab('steps')">
                         🔧 Steps
@@ -2323,6 +2350,133 @@
                     <button class="admin-tab ${currentAdminTab === 'report' ? 'active' : ''}" onclick="switchAdminTab('report')">
                         📊 Report
                     </button>
+                    ${currentUser && currentUser.role === 'superadmin' ? `
+                    <button class="admin-tab ${currentAdminTab === 'locations' ? 'active' : ''}" onclick="switchAdminTab('locations')">
+                        🏢 Locations
+                    </button>
+                    ` : ''}
+                </div>
+
+                <!-- Dashboard Tab -->
+                <div class="admin-content ${currentAdminTab === 'dashboard' ? 'active' : ''}">
+                    <div class="admin-section">
+                        <h2 class="section-title">📊 Management Dashboard</h2>
+                        
+                        <!-- Quick Stats -->
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px;">
+                            <div style="background: #e6f7ff; border: 2px solid #4299e1; border-radius: 8px; padding: 20px; text-align: center;">
+                                <div style="font-size: 32px; font-weight: bold; color: #4299e1;" id="totalLocations">-</div>
+                                <div style="font-size: 14px; color: #2c5282;">Total Locations</div>
+                            </div>
+                            <div style="background: #f0fdf4; border: 2px solid #48bb78; border-radius: 8px; padding: 20px; text-align: center;">
+                                <div style="font-size: 32px; font-weight: bold; color: #48bb78;" id="totalUsers">-</div>
+                                <div style="font-size: 14px; color: #22543d;">Total Users</div>
+                            </div>
+                            <div style="background: #fef3c7; border: 2px solid #f59e0b; border-radius: 8px; padding: 20px; text-align: center;">
+                                <div style="font-size: 32px; font-weight: bold; color: #f59e0b;" id="totalAdmins">-</div>
+                                <div style="font-size: 14px; color: #78350f;">Administrators</div>
+                            </div>
+                            <div style="background: #fce7f3; border: 2px solid #ec4899; border-radius: 8px; padding: 20px; text-align: center;">
+                                <div style="font-size: 32px; font-weight: bold; color: #ec4899;" id="totalSuperAdmins">-</div>
+                                <div style="font-size: 14px; color: #831843;">Super Admins</div>
+                            </div>
+                        </div>
+                        
+                        <!-- Locations Overview -->
+                        <div style="background: white; border: 2px solid #e2e8f0; border-radius: 8px; padding: 20px; margin-bottom: 20px;">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                                <h3 style="margin: 0;">🏢 Locations Overview</h3>
+                                <button class="btn" onclick="showAddLocationForm()" style="background: #48bb78; padding: 8px 16px; font-size: 13px;">
+                                    ➕ Add Location
+                                </button>
+                            </div>
+                            <div id="locationsTable">Loading...</div>
+                        </div>
+                        
+                        <!-- Users by Location -->
+                        <div style="background: white; border: 2px solid #e2e8f0; border-radius: 8px; padding: 20px;">
+                            <h3 style="margin-bottom: 15px;">👥 Users by Location</h3>
+                            <div style="margin-bottom: 15px;">
+                                <label style="font-size: 13px; font-weight: bold; margin-right: 10px;">Filter by Location:</label>
+                                <select id="locationFilter" onchange="filterUsersByLocation(this.value)" 
+                                        style="padding: 6px; border: 2px solid #cbd5e0; border-radius: 4px; font-size: 13px;">
+                                    <option value="all">All Locations</option>
+                                </select>
+                            </div>
+                            <div id="usersTable">Loading...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- User Management Tab -->
+                <div class="admin-content ${currentAdminTab === 'usermgmt' ? 'active' : ''}">
+                    <div class="admin-section">
+                        <h2 class="section-title">👥 User Management</h2>
+                        
+                        <div style="background: #e6f7ff; border: 2px solid #4299e1; padding: 15px; border-radius: 6px; margin-bottom: 20px;">
+                            <strong>✨ One-Step User Creation</strong><br>
+                            Create users instantly! They can login immediately with the email and password you set.
+                        </div>
+                        
+                        <div style="background: white; padding: 20px; border-radius: 8px; border: 2px solid #e2e8f0;">
+                            <h3>Create New User</h3>
+                            
+                            <div class="form-group">
+                                <label>Email *</label>
+                                <input type="email" id="newUserEmail" placeholder="user@example.com" style="width: 100%; padding: 8px; border: 2px solid #cbd5e0; border-radius: 4px;">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label>Password * (minimum 6 characters)</label>
+                                <input type="password" id="newUserPassword" placeholder="••••••••" style="width: 100%; padding: 8px; border: 2px solid #cbd5e0; border-radius: 4px;">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label>Username *</label>
+                                <input type="text" id="newUserUsername" placeholder="johndoe" style="width: 100%; padding: 8px; border: 2px solid #cbd5e0; border-radius: 4px;">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label>Full Name *</label>
+                                <input type="text" id="newUserFullName" placeholder="John Doe" style="width: 100%; padding: 8px; border: 2px solid #cbd5e0; border-radius: 4px;">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label>Role *</label>
+                                <select id="newUserRole" onchange="toggleDepartmentField()" style="width: 100%; padding: 8px; border: 2px solid #cbd5e0; border-radius: 4px;">
+                                    <option value="technician">Technician</option>
+                                    <option value="manager">Manager</option>
+                                    <option value="administrator">Administrator</option>
+                                    ${currentUser && currentUser.role === 'superadmin' ? '<option value="superadmin">Super Admin</option>' : ''}
+                                </select>
+                            </div>
+                            
+                            <div class="form-group" id="locationFieldGroup">
+                                <label>Location *</label>
+                                <select id="newUserLocation" style="width: 100%; padding: 8px; border: 2px solid #cbd5e0; border-radius: 4px;">
+                                    ${userLocations.map(loc => `
+                                        <option value="${loc.id}" ${loc.id === currentLocationId ? 'selected' : ''}>${loc.name}</option>
+                                    `).join('')}
+                                </select>
+                            </div>
+                            
+                            <div class="form-group" id="departmentFieldGroup">
+                                <label>Department (for technicians)</label>
+                                <input type="text" id="newUserDepartment" placeholder="Detail, Mechanical, Xpel, etc." style="width: 100%; padding: 8px; border: 2px solid #cbd5e0; border-radius: 4px;">
+                            </div>
+                            
+                            <button class="btn" onclick="createNewUser(event)" style="background: #48bb78; width: 100%;">
+                                ✅ Create User
+                            </button>
+                        </div>
+                        
+                        <div style="margin-top: 30px;">
+                            <h3>Existing Users</h3>
+                            <div id="userManagementList" style="background: white; padding: 20px; border-radius: 8px; border: 2px solid #e2e8f0;">
+                                Loading users...
+                            </div>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="admin-content ${currentAdminTab === 'import' ? 'active' : ''}">
@@ -2330,15 +2484,15 @@
                         <h2 class="section-title">📋 Import Vehicles from Excel</h2>
                         <div style="background: #f7fafc; padding: 15px; border-radius: 4px; margin-bottom: 15px;">
                             <p style="margin-bottom: 10px; font-size: 14px;">
-                                Upload a CSV file with columns: VIN, Stock Number, Miles, Appraisal Notes, Skip Steps
+                                Upload a CSV file with columns: VIN, Stock Number, Year, Make, Model, Miles, Appraisal Notes, Skip Steps
                             </p>
                             <p style="margin-bottom: 10px; font-size: 13px; color: #718096;">
-                                <strong>Note:</strong> Duplicate stock numbers will be automatically skipped
+                                <strong>Note:</strong> New vehicles are added · Existing stock numbers get year/make/model/miles updated (VIN &amp; stock are never changed)
                             </p>
                             <input type="file" id="excelImport" accept=".csv" 
                                    onchange="handleExcelImport(event)"
                                    style="width: 100%; padding: 10px; border: 1px solid #cbd5e0; border-radius: 4px; font-size: 14px;">
-                            <button class="btn" onclick="window.open('/mnt/user-data/outputs/vehicle-import-template.csv')" 
+                            <button class="btn" onclick="downloadImportTemplate()" 
                                     style="margin-top: 10px; background: #4299e1;">
                                 📥 Download Template
                             </button>
@@ -2692,6 +2846,11 @@
                         <p style="margin-bottom: 15px; color: #718096; font-size: 14px;">
                             Workflows define which steps a vehicle goes through. Click steps in the order you want them. The number shows the order.
                         </p>
+                        <div style="background:#edf2f7;border-radius:6px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:#4a5568;display:flex;gap:16px;align-items:center;flex-wrap:wrap;">
+                            <span>🔌 Supabase: <strong>${USE_SUPABASE && supabaseClient ? '✅ Connected' : '❌ Not connected'}</strong></span>
+                            <span>📍 Location ID: <strong>${currentLocationId || '⚠️ None — log in first'}</strong></span>
+                            <button onclick="testWorkflowDB()" style="background:#4299e1;color:white;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:12px;font-weight:bold;">🧪 Test DB Write</button>
+                        </div>
                         
                         ${Object.entries(workflows).map(([id, workflow]) => `
                             <div style="margin-bottom: 20px; padding: 20px; background: #f7fafc; border-left: 4px solid ${workflow.color}; border-radius: 4px;">
@@ -2898,13 +3057,55 @@
                         </table>
                     </div>
                 </div>
+
+                <!-- Locations Tab (superadmin only) -->
+                ${currentUser && currentUser.role === 'superadmin' ? `
+                <div class="admin-content ${currentAdminTab === 'locations' ? 'active' : ''}">
+                    <div class="admin-section">
+                        <h2 class="section-title">🏢 Location Management</h2>
+
+                        <div style="background: white; padding: 20px; border-radius: 8px; border: 2px solid #e2e8f0; margin-bottom: 24px;">
+                            <h3 style="margin-bottom: 16px;">➕ Create New Location</h3>
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                                <div class="form-group">
+                                    <label>Location Name *</label>
+                                    <input type="text" id="locMgmtName" placeholder="Miami Store" style="width:100%;padding:8px;border:2px solid #cbd5e0;border-radius:4px;">
+                                </div>
+                                <div class="form-group">
+                                    <label>Address</label>
+                                    <input type="text" id="locMgmtAddress" placeholder="123 Main St" style="width:100%;padding:8px;border:2px solid #cbd5e0;border-radius:4px;">
+                                </div>
+                                <div class="form-group">
+                                    <label>City *</label>
+                                    <input type="text" id="locMgmtCity" placeholder="Miami" style="width:100%;padding:8px;border:2px solid #cbd5e0;border-radius:4px;">
+                                </div>
+                                <div class="form-group">
+                                    <label>State * (2 letters)</label>
+                                    <input type="text" id="locMgmtState" placeholder="FL" maxlength="2" style="width:100%;padding:8px;border:2px solid #cbd5e0;border-radius:4px;text-transform:uppercase;">
+                                </div>
+                            </div>
+                            <button class="btn" onclick="createLocationFromTab()" style="background:#48bb78;margin-top:12px;width:100%;">
+                                ✅ Create Location
+                            </button>
+                        </div>
+
+                        <div style="background: white; padding: 20px; border-radius: 8px; border: 2px solid #e2e8f0;">
+                            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+                                <h3 style="margin:0;">Existing Locations</h3>
+                                <button class="btn" onclick="refreshLocationsList()" style="background:#4299e1;padding:6px 14px;font-size:13px;">🔄 Refresh</button>
+                            </div>
+                            <div id="locMgmtList">Loading locations...</div>
+                        </div>
+                    </div>
+                </div>
+                ` : ''}
             `;
         }
         function renderReporting() {
             // Calculate bottlenecks
             const avgTimeByStep = {};
             STEPS.forEach(step => {
-                const vehiclesInStep = vehicles.filter(v => v.completedSteps.includes(step));
+                const vehiclesInStep = vehicles.filter(v => v.completedSteps && v.completedSteps.includes(step));
                 if (vehiclesInStep.length > 0) {
                     // Simplified - in real system would track actual times
                     avgTimeByStep[step] = Math.random() * 3 + 0.5;
@@ -2981,7 +3182,7 @@
                             </tr>
                         </thead>
                         <tbody>
-                            ${Object.entries(technicians).flatMap(([step, techs]) => 
+                            ${Object.entries(technicians || {}).filter(([,techs]) => Array.isArray(techs)).flatMap(([step, techs]) => 
                                 techs.map(tech => `
                                     <tr>
                                         <td>${tech}</td>
@@ -3022,6 +3223,7 @@
                 
                 // Set current user
                 currentUser = {
+                    id: profile.id,
                     username: profile.username,
                     role: profile.role,
                     name: profile.full_name,
@@ -3057,20 +3259,32 @@
         }
         
         async function loadAllLocationsForSuperAdmin() {
+            console.log('🔍 Loading all locations for super admin...');
             const { data: locations, error } = await supabaseClient
                 .from('locations')
                 .select('*')
                 .order('name');
             
+            if (error) {
+                console.error('❌ Error loading locations:', error);
+                alert('Error loading locations: ' + error.message);
+                return;
+            }
+            
+            console.log('📍 Locations found:', locations);
+            
             if (locations && locations.length > 0) {
                 userLocations = locations;
                 currentLocationId = locations[0].id; // Default to first location
                 console.log(`✅ Loaded ${locations.length} locations`);
+                console.log('📍 Default location:', locations[0].name);
+            } else {
+                console.warn('⚠️ No locations found in database!');
             }
         }
         
         async function loadDataFromSupabase() {
-            if (!supabase || !currentLocationId) {
+            if (!supabaseClient || !currentLocationId) {
                 console.log('⚠️ Skipping data load - no location selected');
                 return;
             }
@@ -3108,32 +3322,26 @@
                         noteHistory: []
                     }));
                     
-                    // Load notes for each vehicle
-                    for (let vehicle of vehicles) {
-                        const { data: notes } = await supabaseClient
-                            .from('vehicle_notes')
-                            .select('*')
-                            .eq('vehicle_id', vehicle.id)
-                            .order('created_at', { ascending: false });
-                        
-                        if (notes) {
-                            vehicle.noteHistory = notes.map(n => ({
-                                text: n.note_text,
-                                timestamp: new Date(n.created_at),
-                                user: n.username,
-                                id: n.id
-                            }));
-                        }
-                    }
-                    
                     console.log(`✅ Loaded ${vehicles.length} vehicles`);
                 }
                 
-                // Load workflows
-                const { data: workflowData } = await supabaseClient
-                    .from('workflows')
-                    .select('*')
-                    .eq('location_id', currentLocationId);
+                // Load workflows, technicians, step thresholds, tag definitions, and notes all in parallel
+                const vehicleIds = vehicles.map(v => v.id);
+                const [
+                    { data: workflowData },
+                    { data: techData },
+                    { data: thresholdData },
+                    { data: tagData },
+                    { data: allNotes }
+                ] = await Promise.all([
+                    supabaseClient.from('workflows').select('*').eq('location_id', currentLocationId),
+                    supabaseClient.from('technicians').select('*').eq('location_id', currentLocationId),
+                    supabaseClient.from('step_thresholds').select('*').eq('location_id', currentLocationId),
+                    supabaseClient.from('tag_definitions').select('*').eq('location_id', currentLocationId),
+                    vehicleIds.length > 0
+                        ? supabaseClient.from('vehicle_notes').select('*').in('vehicle_id', vehicleIds).order('created_at', { ascending: false })
+                        : Promise.resolve({ data: [] })
+                ]);
                 
                 if (workflowData) {
                     workflows = {};
@@ -3147,12 +3355,6 @@
                     console.log(`✅ Loaded ${workflowData.length} workflows`);
                 }
                 
-                // Load technicians
-                const { data: techData } = await supabaseClient
-                    .from('technicians')
-                    .select('*')
-                    .eq('location_id', currentLocationId);
-                
                 if (techData) {
                     technicians = techData.map(t => ({
                         name: t.name,
@@ -3162,12 +3364,6 @@
                     console.log(`✅ Loaded ${technicians.length} technicians`);
                 }
                 
-                // Load step thresholds
-                const { data: thresholdData } = await supabaseClient
-                    .from('step_thresholds')
-                    .select('*')
-                    .eq('location_id', currentLocationId);
-                
                 if (thresholdData) {
                     stepThresholds = {};
                     thresholdData.forEach(t => {
@@ -3175,12 +3371,6 @@
                     });
                     console.log(`✅ Loaded step thresholds`);
                 }
-                
-                // Load tag definitions
-                const { data: tagData } = await supabaseClient
-                    .from('tag_definitions')
-                    .select('*')
-                    .eq('location_id', currentLocationId);
                 
                 if (tagData) {
                     tagDefinitions = {};
@@ -3191,6 +3381,23 @@
                         };
                     });
                     console.log(`✅ Loaded ${tagData.length} tag definitions`);
+                }
+                
+                // Assign notes to vehicles (single batched query instead of N+1)
+                if (allNotes && allNotes.length > 0) {
+                    const notesByVehicle = {};
+                    for (const n of allNotes) {
+                        if (!notesByVehicle[n.vehicle_id]) notesByVehicle[n.vehicle_id] = [];
+                        notesByVehicle[n.vehicle_id].push({
+                            text: n.note_text,
+                            timestamp: new Date(n.created_at),
+                            user: n.username,
+                            id: n.id
+                        });
+                    }
+                    for (const vehicle of vehicles) {
+                        vehicle.noteHistory = notesByVehicle[vehicle.id] || [];
+                    }
                 }
                 
             } catch (err) {
@@ -3204,19 +3411,55 @@
                 return;
             }
             
+            console.log('🔄 Switching to location:', locationId);
             currentLocationId = locationId;
+            
+            const selectedLocation = userLocations.find(l => l.id === locationId);
+            console.log('📍 Now viewing:', selectedLocation?.name);
+            
             await loadDataFromSupabase();
             render();
+
+            // If user management tab is open, reload it for the new location
+            if (currentAdminTab === 'usermgmt') {
+                setTimeout(() => loadUserManagementList(), 150);
+            }
+        }
+        
+        function handleLocationSwitch(locationId) {
+            console.log('🎯 Location dropdown changed to:', locationId);
+            switchLocation(locationId).catch(err => {
+                console.error('❌ Error switching location:', err);
+                alert('Error switching location: ' + err.message);
+            });
         }
         
         // Event Handlers
         async function login() {
             const email = document.getElementById('username').value;
             const password = document.getElementById('password').value;
-            
+
+            // Show spinner, disable form
+            const btn = document.getElementById('loginBtn');
+            const spinner = document.getElementById('loginSpinner');
+            const spinnerMsg = document.getElementById('loginSpinnerMsg');
+            const form = document.getElementById('loginForm');
+            if (btn) btn.style.display = 'none';
+            if (form) { form.querySelector('input[type=text]').disabled = true; form.querySelector('input[type=password]').disabled = true; }
+            if (spinner) spinner.classList.add('active');
+
+            function setMsg(msg) { if (spinnerMsg) spinnerMsg.textContent = msg; }
+            function resetLogin(errMsg) {
+                if (btn) btn.style.display = 'block';
+                if (spinner) spinner.classList.remove('active');
+                if (form) { form.querySelector('input[type=text]').disabled = false; form.querySelector('input[type=password]').disabled = false; }
+                if (errMsg) alert(errMsg);
+            }
+
             // Try Supabase first if configured
             if (USE_SUPABASE && supabaseClient) {
                 try {
+                    setMsg('Signing in…');
                     console.log('🔐 Attempting Supabase login...');
                     const { data, error } = await supabaseClient.auth.signInWithPassword({
                         email: email,
@@ -3225,25 +3468,28 @@
                     
                     if (error) {
                         console.error('Auth error:', error);
-                        alert('Invalid credentials: ' + error.message);
+                        resetLogin('Invalid credentials: ' + error.message);
                         return;
                     }
                     
                     console.log('✅ Auth successful');
                     
                     if (data.user) {
+                        setMsg('Loading your profile…');
                         await loadUserProfileFromSupabase(data.user.id);
+                        setMsg('Loading location data…');
                         currentView = currentUser.role === 'technician' ? 'technician' : 'dashboard';
                         render();
                     }
                 } catch (err) {
                     console.error('Login exception:', err);
-                    alert('Login error: ' + err.message);
+                    resetLogin('Login error: ' + err.message);
                 }
             } else {
                 // Fallback to mock authentication
                 const username = email;
                 if (users[username] && users[username].password === password) {
+                    setMsg('Loading…');
                     currentUser = {
                         username: username,
                         ...users[username]
@@ -3254,6 +3500,103 @@
                     alert('Invalid credentials');
                 }
             }
+        }
+
+        function openAwaitingModal() {
+            const awaitingVehicles = vehicles.filter(v => !v.workflow || v.workflow === 'AWAITING');
+            const modalHTML = `
+                <div id="awaitingModal" style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:2000;display:flex;align-items:center;justify-content:center;padding:20px;" onclick="if(event.target===this)closeAwaitingModal()">
+                    <div style="background:white;border-radius:10px;padding:24px;max-width:960px;width:100%;max-height:90vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,0.3);">
+                        
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;border-bottom:2px solid #f39c12;padding-bottom:12px;">
+                            <h2 style="margin:0;color:#7c2d12;font-size:20px;">&#9203; Awaiting Arrival (${awaitingVehicles.length})</h2>
+                            <button onclick="closeAwaitingModal()" style="background:#e53e3e;color:white;border:none;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:14px;font-weight:bold;">✕ Close</button>
+                        </div>
+
+                        <!-- BULK ASSIGN ALL PANEL -->
+                        ${awaitingVehicles.length > 0 ? `
+                        <div style="background:linear-gradient(135deg,#1a365d,#2b6cb0);border-radius:10px;padding:18px;margin-bottom:20px;color:white;">
+                            <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">
+                                <span style="font-size:22px;">🤖</span>
+                                <div>
+                                    <div style="font-size:15px;font-weight:bold;">Assign All to Workflow</div>
+                                    <div style="font-size:12px;opacity:0.85;">AI round-robin will distribute techs fairly across all ${awaitingVehicles.length} vehicle${awaitingVehicles.length > 1 ? 's' : ''}</div>
+                                </div>
+                            </div>
+                            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                                <select id="bulkWorkflowSelect" style="flex:1;min-width:200px;padding:10px;font-size:14px;border:2px solid rgba(255,255,255,0.4);border-radius:6px;background:rgba(255,255,255,0.15);color:white;">
+                                    <option value="" style="color:#2d3748;">-- Select Workflow for All --</option>
+                                    ${Object.entries(workflows).map(([id, wf]) => `<option value="${id}" style="color:#2d3748;">${wf.name}</option>`).join('')}
+                                </select>
+                                <button onclick="assignAllAwaitingToWorkflow(document.getElementById('bulkWorkflowSelect').value)"
+                                    style="padding:10px 22px;background:#f6e05e;color:#1a365d;border:none;border-radius:6px;font-size:14px;font-weight:bold;cursor:pointer;white-space:nowrap;">
+                                    ⚡ Assign All Now
+                                </button>
+                            </div>
+                            <div id="bulkAssignProgress" style="display:none;margin-top:10px;font-size:13px;padding:8px;background:rgba(255,255,255,0.2);border-radius:4px;text-align:center;"></div>
+                        </div>
+                        ` : ''}
+
+                        <!-- INDIVIDUAL CARDS -->
+                        ${awaitingVehicles.length > 0 ? `
+                        <div style="font-size:12px;color:#718096;margin-bottom:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;">Or assign individually:</div>
+                        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:15px;">
+                            ${awaitingVehicles.map(vehicle => `
+                                <div style="background:#fffbeb;padding:15px;border-radius:8px;border:2px solid #f39c12;">
+                                    <div style="font-size:14px;font-weight:bold;margin-bottom:6px;color:#2d3748;cursor:pointer;" onclick="closeAwaitingModal();showVehicleDetails('${vehicle.vin}')">
+                                        ${vehicle.year || ''} ${vehicle.make || ''} ${vehicle.model || ''}
+                                    </div>
+                                    <div style="font-size:12px;color:#718096;margin-bottom:10px;">
+                                        <div><strong>Stock:</strong> ${vehicle.stockNumber || 'N/A'}</div>
+                                        <div><strong>VIN:</strong> ${vehicle.vin}</div>
+                                        <div><strong>Miles:</strong> ${vehicle.miles?.toLocaleString() || 'N/A'}</div>
+                                    </div>
+                                    <label style="display:block;margin-bottom:4px;font-size:11px;font-weight:bold;color:#4a5568;">Assign Workflow:</label>
+                                    <select id="awmodal_workflow_${vehicle.vin}" style="width:100%;padding:7px;font-size:12px;border:2px solid #cbd5e0;border-radius:4px;margin-bottom:8px;">
+                                        <option value="">-- Select Workflow --</option>
+                                        ${Object.entries(workflows).map(([id, wf]) => `<option value="${id}">${wf.name}</option>`).join('')}
+                                    </select>
+                                    <button onclick="assignWorkflowFromModal('${vehicle.vin}')" style="width:100%;background:#48bb78;color:white;border:none;border-radius:6px;padding:9px;font-size:13px;font-weight:bold;cursor:pointer;">
+                                        ✅ Assign &amp; Start Recon
+                                    </button>
+                                </div>
+                            `).join('')}
+                        </div>
+                        ` : `<div style="text-align:center;padding:40px;color:#718096;"><div style="font-size:48px;margin-bottom:12px;">✅</div><div style="font-size:18px;font-weight:bold;">No vehicles awaiting!</div><div style="font-size:14px;margin-top:8px;">All vehicles have been assigned to workflows.</div></div>`}
+
+                    </div>
+                </div>
+            `;
+            document.body.insertAdjacentHTML('beforeend', modalHTML);
+        }
+
+        function closeAwaitingModal() {
+            const modal = document.getElementById('awaitingModal');
+            if (modal) modal.remove();
+        }
+
+        function assignWorkflowFromModal(vin) {
+            const select = document.getElementById('awmodal_workflow_' + vin);
+            if (!select || !select.value) {
+                alert('Please select a workflow first');
+                return;
+            }
+            const tempId = 'workflow_' + vin;
+            const existing = document.getElementById(tempId);
+            if (!existing) {
+                const temp = document.createElement('select');
+                temp.id = tempId;
+                const opt = document.createElement('option');
+                opt.value = select.value;
+                opt.selected = true;
+                temp.appendChild(opt);
+                document.body.appendChild(temp);
+                assignWorkflowToVehicle(vin).then(() => temp.remove());
+            } else {
+                existing.value = select.value;
+                assignWorkflowToVehicle(vin);
+            }
+            closeAwaitingModal();
         }
 
         async function logout() {
@@ -3434,7 +3777,695 @@
 
         function switchAdminTab(tab) {
             currentAdminTab = tab;
+            if (tab === 'dashboard') {
+                setTimeout(() => loadManagementDashboard(), 100);
+            } else if (tab === 'usermgmt') {
+                setTimeout(() => loadUserManagementList(), 100);
+            } else if (tab === 'locations') {
+                setTimeout(() => refreshLocationsList(), 100);
+            }
             render();
+        }
+
+        // ============================================
+        // MANAGEMENT DASHBOARD FUNCTIONS
+        // ============================================
+        
+        async function loadManagementDashboard() {
+            if (!supabaseClient) return;
+            
+            try {
+                // Load locations
+                const { data: locations, error: locError } = await supabaseClient
+                    .from('locations')
+                    .select('*')
+                    .order('name');
+                
+                // Load users with location info
+                const { data: users, error: userError } = await supabaseClient
+                    .from('user_profiles')
+                    .select(`
+                        *,
+                        locations (name, city, state)
+                    `)
+                    .order('created_at', { ascending: false });
+                
+                if (locations) {
+                    const totalLocsEl = document.getElementById('totalLocations');
+                    if (totalLocsEl) totalLocsEl.textContent = locations.length;
+                    
+                    const filterSelect = document.getElementById('locationFilter');
+                    if (filterSelect) {
+                        filterSelect.innerHTML = '<option value="all">All Locations</option>' +
+                            locations.map(loc => `<option value="${loc.id}">${loc.name}</option>`).join('');
+                    }
+                    
+                    renderLocationsTable(locations, users);
+                }
+                
+                if (users) {
+                    const totalUsersEl = document.getElementById('totalUsers');
+                    const totalAdminsEl = document.getElementById('totalAdmins');
+                    const totalSuperAdminsEl = document.getElementById('totalSuperAdmins');
+                    
+                    if (totalUsersEl) totalUsersEl.textContent = users.length;
+                    if (totalAdminsEl) totalAdminsEl.textContent = users.filter(u => u.role === 'administrator').length;
+                    if (totalSuperAdminsEl) totalSuperAdminsEl.textContent = users.filter(u => u.role === 'superadmin').length;
+                    
+                    renderUsersTable(users);
+                }
+                
+            } catch (error) {
+                console.error('Dashboard load error:', error);
+            }
+        }
+        
+        function renderLocationsTable(locations, users) {
+            const container = document.getElementById('locationsTable');
+            if (!container) return;
+            
+            const html = `
+                <table style="width: 100%; border-collapse: collapse;">
+                    <thead>
+                        <tr style="background: #f7fafc; border-bottom: 2px solid #e2e8f0;">
+                            <th style="text-align: left; padding: 12px; font-size: 13px;">Location Name</th>
+                            <th style="text-align: left; padding: 12px; font-size: 13px;">City, State</th>
+                            <th style="text-align: center; padding: 12px; font-size: 13px;">Users</th>
+                            <th style="text-align: center; padding: 12px; font-size: 13px;">Admins</th>
+                            <th style="text-align: center; padding: 12px; font-size: 13px;">Techs</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${locations.map(loc => {
+                            const locationUsers = users ? users.filter(u => u.location_id === loc.id) : [];
+                            const admins = locationUsers.filter(u => u.role === 'administrator').length;
+                            const techs = locationUsers.filter(u => u.role === 'technician').length;
+                            
+                            return `
+                                <tr style="border-bottom: 1px solid #e2e8f0;">
+                                    <td style="padding: 12px; font-weight: bold;">${loc.name}</td>
+                                    <td style="padding: 12px;">${loc.city}, ${loc.state}</td>
+                                    <td style="padding: 12px; text-align: center;">${locationUsers.length}</td>
+                                    <td style="padding: 12px; text-align: center;">${admins}</td>
+                                    <td style="padding: 12px; text-align: center;">${techs}</td>
+                                </tr>
+                            `;
+                        }).join('')}
+                    </tbody>
+                </table>
+            `;
+            
+            container.innerHTML = html;
+        }
+        
+        function renderUsersTable(users, filterLocationId = 'all') {
+            const container = document.getElementById('usersTable');
+            if (!container) return;
+            
+            const filtered = filterLocationId === 'all' 
+                ? users 
+                : users.filter(u => u.location_id === filterLocationId);
+            
+            const html = `
+                <table style="width: 100%; border-collapse: collapse;">
+                    <thead>
+                        <tr style="background: #f7fafc; border-bottom: 2px solid #e2e8f0;">
+                            <th style="text-align: left; padding: 12px; font-size: 13px;">Username</th>
+                            <th style="text-align: left; padding: 12px; font-size: 13px;">Full Name</th>
+                            <th style="text-align: left; padding: 12px; font-size: 13px;">Role</th>
+                            <th style="text-align: left; padding: 12px; font-size: 13px;">Location</th>
+                            <th style="text-align: left; padding: 12px; font-size: 13px;">Department</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${filtered.length > 0 ? filtered.map(u => `
+                            <tr style="border-bottom: 1px solid #e2e8f0;">
+                                <td style="padding: 12px;">${u.username}</td>
+                                <td style="padding: 12px;">${u.full_name}</td>
+                                <td style="padding: 12px;">
+                                    <span style="padding: 4px 8px; background: ${
+                                        u.role === 'superadmin' ? '#fce7f3' : 
+                                        u.role === 'administrator' ? '#fef3c7' : 
+                                        '#dbeafe'
+                                    }; border-radius: 4px; font-size: 11px;">
+                                        ${u.role}
+                                    </span>
+                                </td>
+                                <td style="padding: 12px;">${u.locations ? u.locations.name : '🌟 All Locations'}</td>
+                                <td style="padding: 12px;">${u.department || '-'}</td>
+                            </tr>
+                        `).join('') : '<tr><td colspan="5" style="padding: 20px; text-align: center; color: #718096;">No users found</td></tr>'}
+                    </tbody>
+                </table>
+            `;
+            
+            container.innerHTML = html;
+        }
+        
+        async function filterUsersByLocation(locationId) {
+            const { data: users } = await supabaseClient
+                .from('user_profiles')
+                .select(`
+                    *,
+                    locations (name, city, state)
+                `);
+            
+            renderUsersTable(users, locationId);
+        }
+        
+        function showAddLocationForm() {
+            const modal = document.getElementById('addLocationModal');
+            if (modal) modal.style.display = 'flex';
+        }
+        
+        function closeAddLocationModal() {
+            const modal = document.getElementById('addLocationModal');
+            if (modal) modal.style.display = 'none';
+            document.getElementById('newLocationName').value = '';
+            document.getElementById('newLocationAddress').value = '';
+            document.getElementById('newLocationCity').value = '';
+            document.getElementById('newLocationState').value = '';
+        }
+        
+
+        // ============================================
+        // LOCATION MANAGEMENT TAB FUNCTIONS
+        // ============================================
+
+        async function createLocationFromTab() {
+            const name    = (document.getElementById('locMgmtName')?.value || '').trim();
+            const address = (document.getElementById('locMgmtAddress')?.value || '').trim();
+            const city    = (document.getElementById('locMgmtCity')?.value || '').trim();
+            const state   = (document.getElementById('locMgmtState')?.value || '').trim().toUpperCase();
+
+            if (!name || !city || !state) {
+                alert('Please fill in Name, City, and State');
+                return;
+            }
+            if (state.length !== 2) {
+                alert('State must be 2 letters (e.g. FL)');
+                return;
+            }
+
+            try {
+                // Create the location record — no workflows, no steps seeded
+                const { data, error } = await supabaseClient
+                    .from('locations')
+                    .insert({ name, address, city, state })
+                    .select().single();
+
+                if (error) throw new Error(error.message);
+
+                // New location starts completely empty — no workflows or steps copied
+                console.log(`✅ New blank location created: ${name} (id: ${data.id})`);
+
+                alert(`✅ Location "${name}" created!\n\nThis location starts with no workflows or steps. Configure them in the Admin Panel after switching to this location.`);
+                document.getElementById('locMgmtName').value = '';
+                document.getElementById('locMgmtAddress').value = '';
+                document.getElementById('locMgmtCity').value = '';
+                document.getElementById('locMgmtState').value = '';
+
+                // Refresh superadmin location list and the locations dropdown
+                await refreshLocationsList();
+                await loadAllLocationsForSuperAdmin();
+            } catch (err) {
+                alert('❌ Error creating location: ' + err.message);
+            }
+        }
+
+        async function refreshLocationsList() {
+            const container = document.getElementById('locMgmtList');
+            if (!container) return;
+            container.innerHTML = 'Loading...';
+
+            try {
+                const { data: locs, error } = await supabaseClient
+                    .from('locations')
+                    .select('*')
+                    .order('name');
+
+                if (error) throw new Error(error.message);
+
+                if (!locs || locs.length === 0) {
+                    container.innerHTML = '<p style="color:#718096;">No locations found.</p>';
+                    return;
+                }
+
+                container.innerHTML = `
+                    <table style="width:100%;border-collapse:collapse;">
+                        <thead>
+                            <tr style="border-bottom:2px solid #e2e8f0;background:#f7fafc;">
+                                <th style="text-align:left;padding:10px;font-size:13px;">Name</th>
+                                <th style="text-align:left;padding:10px;font-size:13px;">City, State</th>
+                                <th style="text-align:left;padding:10px;font-size:13px;">Address</th>
+                                <th style="text-align:left;padding:10px;font-size:13px;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${locs.map(loc => `
+                                <tr style="border-bottom:1px solid #e2e8f0;">
+                                    <td style="padding:10px;font-weight:bold;">${loc.name}</td>
+                                    <td style="padding:10px;">${loc.city}, ${loc.state}</td>
+                                    <td style="padding:10px;color:#718096;">${loc.address || '-'}</td>
+                                    <td style="padding:10px;">
+                                        <button onclick="deleteLocation('${loc.id}', '${loc.name.replace(/'/g, "\'")}')"
+                                            style="background:#e53e3e;color:white;border:none;border-radius:4px;padding:5px 12px;cursor:pointer;font-size:12px;">
+                                            🗑 Delete
+                                        </button>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+            } catch (err) {
+                container.innerHTML = '<p style="color:#e53e3e;">❌ ' + err.message + '</p>';
+            }
+        }
+
+        async function deleteLocation(locationId, locationName) {
+            if (!confirm('⚠️ Delete location "' + locationName + '"?\n\nThis will NOT delete users or vehicles at this location — just the location record itself.')) return;
+
+            try {
+                const { error } = await supabaseClient
+                    .from('locations')
+                    .delete()
+                    .eq('id', locationId);
+
+                if (error) throw new Error(error.message);
+                alert('✅ Location deleted.');
+                await refreshLocationsList();
+            } catch (err) {
+                alert('❌ Error: ' + err.message);
+            }
+        }
+
+        // ── Delete user ──
+
+        // ============================================
+        // EDIT USER FUNCTIONS
+        // ============================================
+
+        async function openEditUserModal(userId, username, fullName, role, locationId, department) {
+            // Guard: only superadmins can edit superadmin accounts
+            if (role === 'superadmin' && currentUser && currentUser.role !== 'superadmin') {
+                alert('⛔ Only a Super Admin can edit another Super Admin account.');
+                return;
+            }
+
+            // Load locations for the dropdown
+            const { data: locations } = await supabaseClient.from('locations').select('id, name').order('name');
+
+            const locOptions = (locations || []).map(l =>
+                `<option value="${l.id}" ${l.id === locationId ? 'selected' : ''}>${l.name}</option>`
+            ).join('');
+
+            const modalHTML = `
+                <div id="editUserModal" style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:2000;display:flex;align-items:center;justify-content:center;padding:20px;">
+                    <div style="background:white;border-radius:10px;padding:28px;max-width:480px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,0.3);">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+                            <h2 style="margin:0;font-size:18px;">✏️ Edit User — ${username}</h2>
+                            <button onclick="closeEditUserModal()" style="background:#718096;color:white;border:none;border-radius:6px;padding:5px 12px;cursor:pointer;">✕</button>
+                        </div>
+
+                        <input type="hidden" id="editUserId" value="${userId}">
+                        <input type="hidden" id="editUsername" value="${username}">
+
+                        <div style="margin-bottom:14px;">
+                            <label style="display:block;font-weight:600;margin-bottom:5px;font-size:13px;">Full Name</label>
+                            <input type="text" id="editFullName" value="${fullName}" style="width:100%;padding:9px;border:2px solid #cbd5e0;border-radius:6px;font-size:14px;">
+                        </div>
+
+                        <div style="margin-bottom:14px;">
+                            <label style="display:block;font-weight:600;margin-bottom:5px;font-size:13px;">Role</label>
+                            <select id="editRole" onchange="document.getElementById('editLocationGroup').style.display = this.value === 'superadmin' ? 'none' : 'block'"
+                                style="width:100%;padding:9px;border:2px solid #cbd5e0;border-radius:6px;font-size:14px;">
+                                <option value="technician"   ${role === 'technician'   ? 'selected' : ''}>Technician</option>
+                                <option value="manager"      ${role === 'manager'      ? 'selected' : ''}>Manager</option>
+                                <option value="administrator"${role === 'administrator'? 'selected' : ''}>Administrator</option>
+                                <option value="superadmin"   ${role === 'superadmin'   ? 'selected' : ''}>Super Admin</option>
+                            </select>
+                        </div>
+
+                        <div id="editLocationGroup" style="margin-bottom:14px;${role === 'superadmin' ? 'display:none;' : ''}">
+                            <label style="display:block;font-weight:600;margin-bottom:5px;font-size:13px;">📍 Location (Store)</label>
+                            <select id="editLocation" style="width:100%;padding:9px;border:2px solid #4299e1;border-radius:6px;font-size:14px;border-width:2px;">
+                                <option value="">— No Location —</option>
+                                ${locOptions}
+                            </select>
+                        </div>
+
+                        <div style="margin-bottom:20px;">
+                            <label style="display:block;font-weight:600;margin-bottom:5px;font-size:13px;">Department <span style="font-weight:400;color:#718096;">(technicians only)</span></label>
+                            <input type="text" id="editDepartment" value="${department}" placeholder="Detail, Mechanical, Xpel…" style="width:100%;padding:9px;border:2px solid #cbd5e0;border-radius:6px;font-size:14px;">
+                        </div>
+
+                        <div style="display:flex;gap:10px;">
+                            <button onclick="saveEditUser()" style="flex:1;background:#48bb78;color:white;border:none;border-radius:6px;padding:11px;font-size:14px;font-weight:bold;cursor:pointer;">
+                                ✅ Save Changes
+                            </button>
+                            <button onclick="closeEditUserModal()" style="flex:1;background:#e2e8f0;color:#4a5568;border:none;border-radius:6px;padding:11px;font-size:14px;cursor:pointer;">
+                                Cancel
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.body.insertAdjacentHTML('beforeend', modalHTML);
+        }
+
+        function closeEditUserModal() {
+            const modal = document.getElementById('editUserModal');
+            if (modal) modal.remove();
+        }
+
+        async function saveEditUser() {
+            const userId     = document.getElementById('editUserId').value;
+            const username   = document.getElementById('editUsername').value;
+            const fullName   = document.getElementById('editFullName').value.trim();
+            const role       = document.getElementById('editRole').value;
+            const locationId = document.getElementById('editLocation')?.value || null;
+            const department = document.getElementById('editDepartment').value.trim();
+
+            if (!fullName) { alert('Full name is required'); return; }
+
+            // Guard: only superadmins can assign or change the superadmin role
+            if (role === 'superadmin' && currentUser && currentUser.role !== 'superadmin') {
+                alert('⛔ Only a Super Admin can assign the Super Admin role.');
+                return;
+            }
+
+            try {
+                const { error } = await supabaseClient
+                    .rpc('update_user_profile', {
+                        target_user_id: userId,
+                        new_full_name:  fullName,
+                        new_role:       role,
+                        new_location_id: role === 'superadmin' ? null : (locationId || null),
+                        new_department:  department || null
+                    });
+
+                if (error) throw new Error(error.message);
+
+                alert('✅ User "' + username + '" updated!');
+                closeEditUserModal();
+                await loadUserManagementList();
+            } catch (err) {
+                alert('❌ Error saving changes: ' + err.message);
+            }
+        }
+
+        async function deleteUser(userId, username, userRole) {
+            // Guard: never delete a superadmin account
+            if (userRole === 'superadmin') {
+                alert('⛔ Super Admin accounts cannot be deleted.');
+                return;
+            }
+            // Guard: never let someone delete themselves
+            if (currentUser && userId === currentUser.id) {
+                alert('⛔ You cannot delete your own account.');
+                return;
+            }
+            // Guard: administrators cannot delete other administrators
+            if (currentUser && currentUser.role === 'administrator' && userRole === 'administrator') {
+                alert('⛔ Administrators cannot delete other administrator accounts.');
+                return;
+            }
+
+            if (!confirm('⚠️ Delete user "' + username + '"?\n\nThis removes their profile — they will no longer be able to log in.')) return;
+
+            try {
+                // Use SECURITY DEFINER function to bypass RLS
+                const { error } = await supabaseClient
+                    .rpc('delete_user_profile', { target_user_id: userId });
+
+                if (error) throw new Error(error.message);
+                alert('✅ User "' + username + '" deleted.');
+                await loadUserManagementList();
+            } catch (err) {
+                alert('❌ Error deleting user: ' + err.message);
+            }
+        }
+
+        async function saveNewLocation() {
+            const name = document.getElementById('newLocationName').value.trim();
+            const address = document.getElementById('newLocationAddress').value.trim();
+            const city = document.getElementById('newLocationCity').value.trim();
+            const state = document.getElementById('newLocationState').value.toUpperCase().trim();
+            
+            if (!name || !city || !state) {
+                alert('Please fill in required fields (Name, City, State)');
+                return;
+            }
+            
+            try {
+                // Create the location record — no workflows, no steps seeded
+                const { data, error } = await supabaseClient
+                    .from('locations')
+                    .insert({ name, address, city, state })
+                    .select()
+                    .single();
+                
+                if (error) {
+                    alert('Error creating location: ' + error.message);
+                    return;
+                }
+
+                // New location starts completely empty — no workflows or steps copied
+                console.log(`✅ New blank location created: ${name} (id: ${data.id})`);
+                
+                alert(`✅ Location "${name}" created!\n\nThis location starts with no workflows or steps. Configure them in the Admin Panel after switching to this location.`);
+                closeAddLocationModal();
+                await loadManagementDashboard();
+                
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Error: ' + error.message);
+            }
+        }
+        
+        // ============================================
+        // USER MANAGEMENT FUNCTIONS
+        // ============================================
+        
+        function downloadImportTemplate() {
+            const headers = ['VIN', 'Stock Number', 'Year', 'Make', 'Model', 'Miles', 'Appraisal Notes', 'Skip Steps'];
+            const example = ['1HGBH41JXMN109186', 'A12345', '2022', 'Honda', 'Accord', '35000', 'Trade-in good condition', ''];
+            const csv = [headers.join(','), example.join(',')].join('\n');
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'vehicle-import-template.csv';
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function toggleDepartmentField() {
+            const role = document.getElementById('newUserRole').value;
+            const deptField = document.getElementById('departmentFieldGroup');
+            const locField = document.getElementById('locationFieldGroup');
+            
+            if (deptField) {
+                if (role === 'technician') {
+                    deptField.style.display = 'block';
+                } else {
+                    deptField.style.display = 'none';
+                }
+            }
+            
+            if (locField) {
+                if (role === 'superadmin') {
+                    locField.style.display = 'none';
+                } else {
+                    locField.style.display = 'block';
+                }
+            }
+        }
+        
+        async function createNewUser(event) {
+            const email = document.getElementById('newUserEmail').value.trim();
+            const password = document.getElementById('newUserPassword').value;
+            const username = document.getElementById('newUserUsername').value.trim();
+            const fullName = document.getElementById('newUserFullName').value.trim();
+            const role = document.getElementById('newUserRole').value;
+            const locationId = role === 'superadmin' ? null : document.getElementById('newUserLocation').value;
+            const department = role === 'technician' ? document.getElementById('newUserDepartment').value : null;
+            
+            // Validation
+            if (!email || !password || !username || !fullName) {
+                alert('Please fill in all required fields (Email, Password, Username, Full Name)');
+                return;
+            }
+            
+            if (password.length < 6) {
+                alert('Password must be at least 6 characters');
+                return;
+            }
+
+            const btn = event.target;
+            const originalText = btn.textContent;
+            btn.textContent = '⏳ Creating user...';
+            btn.disabled = true;
+
+            try {
+                console.log('📝 Creating user via signUp...');
+
+                // Step 1: Sign up the new user
+                // This creates them in auth.users
+                const { data: signUpData, error: signUpError } = await supabaseClient.auth.signUp({
+                    email: email,
+                    password: password,
+                    options: {
+                        data: {
+                            username: username,
+                            full_name: fullName
+                        }
+                    }
+                });
+
+                if (signUpError) {
+                    throw new Error(signUpError.message);
+                }
+
+                if (!signUpData?.user) {
+                    throw new Error('User creation failed - no user returned');
+                }
+
+                console.log('✅ Auth user created:', signUpData.user.id);
+
+                // Step 2: Create the user profile via secure function (bypasses RLS)
+                const { error: profileError } = await supabaseClient.rpc('create_user_profile', {
+                    user_id: signUpData.user.id,
+                    user_username: username,
+                    user_full_name: fullName,
+                    user_role: role,
+                    user_location_id: role === 'superadmin' ? null : locationId,
+                    user_department: department || null
+                });
+
+                if (profileError) {
+                    console.error('Profile error:', profileError);
+                    throw new Error('User created but profile failed: ' + profileError.message);
+                }
+
+                console.log('✅ Profile created for:', signUpData.user.id);
+
+                // Success!
+                alert(`✅ User created successfully!\n\nThey can now login with:\nEmail: ${email}\nPassword: (the password you set)`);
+
+                // Clear form
+                document.getElementById('newUserEmail').value = '';
+                document.getElementById('newUserPassword').value = '';
+                document.getElementById('newUserUsername').value = '';
+                document.getElementById('newUserFullName').value = '';
+                const deptField = document.getElementById('newUserDepartment');
+                if (deptField) deptField.value = '';
+
+                // Reload users list
+                await loadUserManagementList();
+
+                btn.textContent = originalText;
+                btn.disabled = false;
+
+            } catch (error) {
+                console.error('❌ Error:', error);
+
+                let errorMessage = error.message;
+                if (error.message.includes('already registered') || error.message.includes('already been registered')) {
+                    errorMessage = '❌ This email is already registered!\n\nPlease use a different email address.';
+                } else if (error.message.includes('Password')) {
+                    errorMessage = '❌ Password error: ' + error.message;
+                } else if (error.message.includes('email')) {
+                    errorMessage = '❌ Email error: ' + error.message;
+                }
+
+                alert(errorMessage);
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }
+        }
+            
+        async function loadUserManagementList() {
+            if (!supabaseClient) return;
+
+            const usersList = document.getElementById('userManagementList');
+            if (usersList) usersList.innerHTML = '<p style="color:#718096;">Loading...</p>';
+
+            try {
+                // Use SECURITY DEFINER function to bypass RLS, then filter by current location
+                const { data: allProfiles, error } = await supabaseClient
+                    .rpc('get_all_user_profiles');
+                
+                // Filter to current location only (superadmins see all locations via the store switcher)
+                const profiles = allProfiles ? allProfiles.filter(p => 
+                    p.role === 'superadmin' ||  // always show superadmins
+                    p.location_id === currentLocationId
+                ) : [];
+
+                if (error) {
+                    console.error('Error loading users:', error);
+                    if (usersList) usersList.innerHTML = `<p style="color:#e53e3e;padding:10px;background:#fff5f5;border-radius:6px;border:1px solid #fc8181;">❌ Error: ${error.message}</p>`;
+                    return;
+                }
+
+                if (!usersList) return;
+
+                // Load locations separately to resolve names
+                const { data: locations } = await supabaseClient.from('locations').select('id, name');
+                const locMap = {};
+                if (locations) locations.forEach(l => locMap[l.id] = l.name);
+
+                if (profiles && profiles.length > 0) {
+                    usersList.innerHTML = `
+                        <table style="width:100%;border-collapse:collapse;">
+                            <thead>
+                                <tr style="border-bottom:2px solid #e2e8f0;background:#f7fafc;">
+                                    <th style="text-align:left;padding:10px;">Username</th>
+                                    <th style="text-align:left;padding:10px;">Full Name</th>
+                                    <th style="text-align:left;padding:10px;">Role</th>
+                                    <th style="text-align:left;padding:10px;">Location</th>
+                                    <th style="text-align:left;padding:10px;">Department</th>
+                                    <th style="text-align:left;padding:10px;">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${profiles.filter(p => p.role !== 'superadmin').map(p => `
+                                    <tr style="border-bottom:1px solid #e2e8f0;">
+                                        <td style="padding:10px;">${p.username || '-'}</td>
+                                        <td style="padding:10px;">${p.full_name || '-'}</td>
+                                        <td style="padding:10px;">
+                                            <span style="padding:3px 8px;border-radius:4px;font-size:12px;font-weight:bold;background:${p.role === 'superadmin' ? '#fce7f3' : p.role === 'administrator' ? '#e6f7ff' : '#f0fdf4'};color:${p.role === 'superadmin' ? '#831843' : p.role === 'administrator' ? '#2c5282' : '#22543d'};">
+                                                ${p.role}
+                                            </span>
+                                        </td>
+                                        <td style="padding:10px;">${p.location_id ? (locMap[p.location_id] || p.location_id) : 'All Locations'}</td>
+                                        <td style="padding:10px;">${p.department || '-'}</td>
+                                        <td style="padding:10px;display:flex;gap:6px;">
+                                            <button onclick="openEditUserModal('${p.id}','${p.username}','${p.full_name}','${p.role}','${p.location_id || ''}','${p.department || ''}')"
+                                                style="background:#4299e1;color:white;border:none;border-radius:4px;padding:5px 10px;cursor:pointer;font-size:12px;">
+                                                ✏️ Edit
+                                            </button>
+                                            ${p.role !== 'superadmin' && p.id !== (currentUser && currentUser.id) ? `
+                                            <button onclick="deleteUser('${p.id}', '${p.username}', '${p.role}')"
+                                                style="background:#e53e3e;color:white;border:none;border-radius:4px;padding:5px 10px;cursor:pointer;font-size:12px;">
+                                                🗑 Delete
+                                            </button>` : `
+                                            <span style="font-size:11px;color:#a0aec0;padding:5px 6px;">${p.id === (currentUser && currentUser.id) ? '(you)' : '🔒 Protected'}</span>`}
+                                        </td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    `;
+                } else {
+                    usersList.innerHTML = '<p style="color:#718096;">No users found.</p>';
+                }
+
+            } catch (err) {
+                console.error('Error loading users:', err);
+                if (usersList) usersList.innerHTML = '<p style="color:#e53e3e;">❌ ' + err.message + '</p>';
+            }
         }
 
         function addTagToVehicle(vin, tagName) {
@@ -3672,7 +4703,35 @@
             render();
         }
 
-        function createWorkflow() {
+        async function testWorkflowDB() {
+            const lines = [];
+            lines.push(`supabaseClient: ${!!supabaseClient}`);
+            lines.push(`currentLocationId: ${currentLocationId}`);
+
+            if (!supabaseClient) { alert('❌ No Supabase client.\n\n' + lines.join('\n')); return; }
+            if (!currentLocationId) { alert('❌ No location selected (currentLocationId is null).\nYou must be logged in with a location assigned.\n\n' + lines.join('\n')); return; }
+
+            // Try a SELECT first
+            const { data: sel, error: selErr } = await supabaseClient
+                .from('workflows').select('id, workflow_key, name').eq('location_id', currentLocationId).limit(3);
+            lines.push(`SELECT result: ${selErr ? '❌ ' + selErr.message : '✅ ' + (sel?.length ?? 0) + ' rows'}`);
+
+            // Try an INSERT with a test row
+            const testKey = '_test_' + Date.now();
+            const { data: ins, error: insErr } = await supabaseClient
+                .from('workflows').insert({ workflow_key: testKey, name: 'DB TEST', steps: [], color: '#000000', location_id: currentLocationId }).select();
+            lines.push(`INSERT result: ${insErr ? '❌ ' + insErr.message + ' (code: ' + insErr.code + ')' : '✅ Inserted id=' + ins?.[0]?.id}`);
+
+            // Clean up test row if insert succeeded
+            if (!insErr && ins?.[0]?.id) {
+                await supabaseClient.from('workflows').delete().eq('id', ins[0].id);
+                lines.push('Cleanup: ✅ test row deleted');
+            }
+
+            alert('🧪 Workflow DB Test Results:\n\n' + lines.join('\n'));
+        }
+
+        async function createWorkflow() {
             const name = prompt('Enter new workflow name:');
             if (!name) return;
             
@@ -3681,58 +4740,152 @@
                 alert('A workflow with this name already exists');
                 return;
             }
-            
-            workflows[id] = {
-                name: name,
-                steps: [],
-                color: '#' + Math.floor(Math.random()*16777215).toString(16)
-            };
+
+            const color = '#' + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0');
+            workflows[id] = { name, steps: [], color };
+
+            // Persist to Supabase
+            if (supabaseClient && currentLocationId) {
+                console.log('💾 Attempting to save workflow to Supabase...');
+                console.log('   supabaseClient:', !!supabaseClient);
+                console.log('   currentLocationId:', currentLocationId);
+                console.log('   payload:', { workflow_key: id, name, steps: [], color, location_id: currentLocationId });
+
+                const { data, error } = await supabaseClient.from('workflows').insert({
+                    workflow_key: id,
+                    name: name,
+                    steps: [],
+                    color: color,
+                    location_id: currentLocationId
+                }).select();
+
+                if (error) {
+                    console.error('❌ Supabase insert error:', error);
+                    alert(`❌ Workflow could NOT be saved to database!\n\nError: ${error.message}\nCode: ${error.code}\nDetails: ${error.details || 'none'}\nHint: ${error.hint || 'none'}\n\nThis usually means:\n• Missing RLS policy on workflows table\n• Column name mismatch\n• The workflows table may not exist yet`);
+                } else {
+                    console.log('✅ Workflow saved to Supabase:', data);
+                }
+            } else {
+                console.warn('⚠️ Skipping Supabase save:', { hasClient: !!supabaseClient, locationId: currentLocationId });
+                alert(`⚠️ Workflow saved in memory only!\n\nReason: ${!supabaseClient ? 'No Supabase client' : 'No location selected (currentLocationId is null)'}`);
+            }
             
             render();
             alert(`✓ Workflow "${name}" created. Configure steps in Admin Panel → Workflows tab.`);
         }
 
-        function deleteWorkflow(workflowId) {
-            if (confirm(`Delete workflow "${workflows[workflowId].name}"? Vehicles using this workflow will be moved to CPO.`)) {
-                // Move vehicles to CPO workflow
-                vehicles.forEach(v => {
-                    if (v.workflow === workflowId) {
-                        v.workflow = 'CPO';
-                    }
-                });
-                
-                delete workflows[workflowId];
-                render();
-                alert('✓ Workflow deleted');
+        async function deleteWorkflow(workflowId) {
+            if (!confirm(`Delete workflow "${workflows[workflowId].name}"? Vehicles using this workflow will be moved to CPO.`)) return;
+
+            vehicles.forEach(v => { if (v.workflow === workflowId) v.workflow = 'CPO'; });
+            delete workflows[workflowId];
+
+            if (supabaseClient && currentLocationId) {
+                const { error } = await supabaseClient.from('workflows')
+                    .delete()
+                    .eq('workflow_key', workflowId)
+                    .eq('location_id', currentLocationId);
+                if (error) console.error('❌ Error deleting workflow from DB:', error.message);
+                else console.log('✅ Workflow deleted from Supabase');
             }
+
+            render();
+            alert('✓ Workflow deleted');
         }
 
-        function editWorkflowName(workflowId) {
+        async function editWorkflowName(workflowId) {
             const workflow = workflows[workflowId];
             const newName = prompt(`Enter new name for workflow:`, workflow.name);
             
             if (!newName || newName === workflow.name) return;
             
             workflow.name = newName;
+
+            if (supabaseClient && currentLocationId) {
+                const { error } = await supabaseClient.from('workflows')
+                    .update({ name: newName })
+                    .eq('workflow_key', workflowId)
+                    .eq('location_id', currentLocationId);
+                if (error) console.error('❌ Error updating workflow name in DB:', error.message);
+                else console.log('✅ Workflow name updated in Supabase');
+            }
+
             render();
             alert(`✓ Workflow renamed to "${newName}"`);
         }
 
         function editWorkflowColor(workflowId) {
             const workflow = workflows[workflowId];
-            const newColor = prompt(`Enter new color (hex code):`, workflow.color);
-            
-            if (!newColor || newColor === workflow.color) return;
-            
-            // Validate hex color
-            if (!/^#[0-9A-F]{6}$/i.test(newColor)) {
-                alert('Invalid color. Please use hex format like #48bb78');
-                return;
+
+            const palette = [
+                { color: '#e53e3e', label: 'Red'        },
+                { color: '#dd6b20', label: 'Orange'     },
+                { color: '#d69e2e', label: 'Yellow'     },
+                { color: '#38a169', label: 'Green'      },
+                { color: '#319795', label: 'Teal'       },
+                { color: '#3182ce', label: 'Blue'       },
+                { color: '#553c9a', label: 'Purple'     },
+                { color: '#b83280', label: 'Pink'       },
+                { color: '#2d3748', label: 'Charcoal'   },
+                { color: '#718096', label: 'Gray'       },
+                { color: '#ed8936', label: 'Amber'      },
+                { color: '#48bb78', label: 'Mint'       },
+                { color: '#4299e1', label: 'Sky'        },
+                { color: '#9f7aea', label: 'Lavender'   },
+                { color: '#f687b3', label: 'Rose'       },
+                { color: '#81e6d9', label: 'Aqua'       },
+            ];
+
+            const swatches = palette.map(p => `
+                <button onclick="applyWorkflowColor('${workflowId}', '${p.color}')"
+                    title="${p.label}"
+                    style="width:48px;height:48px;background:${p.color};border:3px solid ${workflow.color === p.color ? '#1a202c' : 'transparent'};
+                           border-radius:8px;cursor:pointer;transition:transform 0.1s;box-shadow:0 2px 4px rgba(0,0,0,0.2);"
+                    onmouseover="this.style.transform='scale(1.15)'" onmouseout="this.style.transform='scale(1)'">
+                </button>
+            `).join('');
+
+            const modal = `
+                <div id="colorPickerModal" style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.55);
+                     z-index:3000;display:flex;align-items:center;justify-content:center;padding:20px;">
+                    <div style="background:white;border-radius:12px;padding:24px;max-width:340px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,0.3);">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;">
+                            <div>
+                                <div style="font-size:16px;font-weight:bold;color:#1a202c;">Pick a Color</div>
+                                <div style="font-size:12px;color:#718096;margin-top:2px;">for "${workflow.name}"</div>
+                            </div>
+                            <button onclick="document.getElementById('colorPickerModal').remove()"
+                                style="background:#e2e8f0;border:none;border-radius:6px;padding:5px 10px;cursor:pointer;font-size:14px;">✕</button>
+                        </div>
+                        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;">
+                            ${swatches}
+                        </div>
+                        <div style="margin-top:16px;padding:10px;background:#f7fafc;border-radius:6px;display:flex;align-items:center;gap:10px;">
+                            <div style="width:32px;height:32px;background:${workflow.color};border-radius:6px;border:2px solid #e2e8f0;flex-shrink:0;"></div>
+                            <span style="font-size:13px;color:#4a5568;">Current color</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.body.insertAdjacentHTML('beforeend', modal);
+        }
+
+        async function applyWorkflowColor(workflowId, color) {
+            document.getElementById('colorPickerModal')?.remove();
+            const workflow = workflows[workflowId];
+            if (!workflow || workflow.color === color) return;
+
+            workflow.color = color;
+
+            if (supabaseClient && currentLocationId) {
+                const { error } = await supabaseClient.from('workflows')
+                    .update({ color })
+                    .eq('workflow_key', workflowId)
+                    .eq('location_id', currentLocationId);
+                if (error) console.error('Error updating workflow color:', error.message);
             }
-            
-            workflow.color = newColor;
+
             render();
-            alert(`✓ Workflow color updated`);
         }
 
         // Temporary storage for workflow step ordering
@@ -3794,7 +4947,7 @@
             });
         }
         
-        function saveWorkflowOrder(workflowId) {
+        async function saveWorkflowOrder(workflowId) {
             if (!workflowEditState[workflowId]) {
                 alert('No changes to save');
                 return;
@@ -3802,9 +4955,22 @@
             
             const workflow = workflows[workflowId];
             workflow.steps = [...workflowEditState[workflowId]];
-            
-            // Clear edit state
             delete workflowEditState[workflowId];
+
+            if (supabaseClient && currentLocationId) {
+                const { error } = await supabaseClient.from('workflows')
+                    .update({ steps: workflow.steps })
+                    .eq('workflow_key', workflowId)
+                    .eq('location_id', currentLocationId);
+                if (error) {
+                    console.error('❌ Error saving workflow steps to DB:', error.message);
+                    alert(`Steps saved locally but DB save failed: ${error.message}`);
+                    return;
+                }
+                console.log('✅ Workflow steps saved to Supabase');
+            } else {
+                console.warn('⚠️ No supabaseClient or currentLocationId — steps saved in memory only');
+            }
             
             render();
             alert(`✓ Step order saved for ${workflow.name}`);
@@ -3841,7 +5007,54 @@
             alert(`✓ Vehicle assigned to ${workflow.name} workflow`);
         }
         
-        function assignWorkflowToVehicle(vin) {
+        // ============================================================
+        // AI ROUND-ROBIN TECHNICIAN ASSIGNMENT
+        // Uses workload counts to fairly distribute assignments
+        // ============================================================
+
+        // Track per-step round-robin counters for AI assignment
+        let rrCounters = {}; // { stepName: { techName: assignmentCount } }
+
+        function aiRoundRobinAssign(step) {
+            const techList = Array.isArray(technicians)
+                ? technicians.filter(t => t.department === step || t.step === step).map(t => t.name || t)
+                : (technicians[step] || []);
+
+            if (techList.length === 0) return assignTechnician(step); // fallback
+            if (techList.length === 1) return techList[0];
+
+            // Init counters for this step if needed
+            if (!rrCounters[step]) {
+                rrCounters[step] = {};
+                techList.forEach(t => { rrCounters[step][t] = 0; });
+            }
+
+            // Count current live assignments for each tech in this step
+            techList.forEach(tech => {
+                rrCounters[step][tech] = vehicles.filter(v =>
+                    v.assignedTech === tech &&
+                    v.currentStep === step &&
+                    v.currentStep !== 'Finished'
+                ).length;
+            });
+
+            // Pick the tech with the fewest current assignments (true round-robin)
+            let bestTech = techList[0];
+            let minLoad = rrCounters[step][bestTech];
+            techList.forEach(tech => {
+                if (rrCounters[step][tech] < minLoad) {
+                    minLoad = rrCounters[step][tech];
+                    bestTech = tech;
+                }
+            });
+
+            // Increment counter so next call in the same batch rotates fairly
+            rrCounters[step][bestTech]++;
+            lastAssignment[step] = bestTech;
+            return bestTech;
+        }
+
+        async function assignWorkflowToVehicle(vin) {
             const vehicle = vehicles.find(v => v.vin === vin);
             if (!vehicle) return;
             
@@ -3860,25 +5073,140 @@
             vehicle.workflow = workflowId;
             vehicle.skippedSteps = STEPS.filter(s => !workflow.steps.includes(s) && s !== 'Finished');
             
-            // Set to first step in workflow
+            // Set to first step in workflow using AI round-robin
             const firstStep = workflow.steps[0];
             if (firstStep && firstStep !== 'Finished') {
                 vehicle.currentStep = firstStep;
                 vehicle.stepStartTime = new Date();
-                vehicle.assignedTech = assignTechnician(firstStep);
+                vehicle.assignedTech = aiRoundRobinAssign(firstStep);
             }
             
             // Add note to history
             if (!vehicle.noteHistory) vehicle.noteHistory = [];
             vehicle.noteHistory.push({
-                text: `Workflow assigned: ${workflow.name}. Started in ${firstStep || 'N/A'}`,
+                text: `Workflow assigned: ${workflow.name}. Started in ${firstStep || 'N/A'}. Tech: ${vehicle.assignedTech}`,
                 timestamp: new Date(),
                 user: currentUser ? currentUser.username : 'Unknown',
                 id: Date.now() + Math.random()
             });
+
+            // Persist to Supabase
+            if (supabaseClient && vehicle.id) {
+                try {
+                    await supabaseClient.from('vehicles').update({
+                        workflow: vehicle.workflow,
+                        current_step: vehicle.currentStep,
+                        step_start_time: vehicle.stepStartTime.toISOString(),
+                        assigned_tech: vehicle.assignedTech,
+                        skipped_steps: vehicle.skippedSteps
+                    }).eq('id', vehicle.id);
+                } catch (e) {
+                    console.warn('Supabase update failed (vehicle will update locally):', e.message);
+                }
+            }
             
             render();
-            alert(`✓ Vehicle assigned to ${workflow.name} workflow and moved to ${firstStep}`);
+            alert(`✓ Vehicle assigned to ${workflow.name} workflow and moved to ${firstStep} → Tech: ${vehicle.assignedTech}`);
+        }
+
+        // ============================================================
+        // BULK ASSIGN ALL AWAITING VEHICLES
+        // ============================================================
+        async function assignAllAwaitingToWorkflow(workflowId) {
+            const awaitingVehicles = vehicles.filter(v => !v.workflow || v.workflow === 'AWAITING');
+            
+            if (awaitingVehicles.length === 0) {
+                alert('No vehicles in the awaiting bucket.');
+                return;
+            }
+
+            if (!workflowId) {
+                alert('Please select a workflow to assign all vehicles to.');
+                return;
+            }
+
+            const workflow = workflows[workflowId];
+            if (!workflow) return;
+
+            const confirmed = confirm(`Assign ALL ${awaitingVehicles.length} waiting vehicles to "${workflow.name}" workflow?\n\nAI round-robin will distribute technicians fairly across all vehicles.`);
+            if (!confirmed) return;
+
+            // Reset round-robin counters for a clean batch assignment
+            rrCounters = {};
+
+            const firstStep = workflow.steps[0];
+            const results = [];
+            let successCount = 0;
+            let failCount = 0;
+
+            // Show progress in the modal
+            const progressDiv = document.getElementById('bulkAssignProgress');
+            if (progressDiv) {
+                progressDiv.style.display = 'block';
+                progressDiv.textContent = `Assigning 0 / ${awaitingVehicles.length}...`;
+            }
+
+            for (let i = 0; i < awaitingVehicles.length; i++) {
+                const vehicle = awaitingVehicles[i];
+
+                vehicle.workflow = workflowId;
+                vehicle.skippedSteps = STEPS.filter(s => !workflow.steps.includes(s) && s !== 'Finished');
+                
+                if (firstStep && firstStep !== 'Finished') {
+                    vehicle.currentStep = firstStep;
+                    vehicle.stepStartTime = new Date();
+                    vehicle.assignedTech = aiRoundRobinAssign(firstStep);
+                }
+
+                if (!vehicle.noteHistory) vehicle.noteHistory = [];
+                vehicle.noteHistory.push({
+                    text: `[Bulk Assign] Workflow: ${workflow.name}. Step: ${firstStep}. Tech: ${vehicle.assignedTech}`,
+                    timestamp: new Date(),
+                    user: currentUser ? currentUser.username : 'Unknown',
+                    id: Date.now() + Math.random()
+                });
+
+                // Persist to Supabase
+                if (supabaseClient && vehicle.id) {
+                    try {
+                        const { error } = await supabaseClient.from('vehicles').update({
+                            workflow: vehicle.workflow,
+                            current_step: vehicle.currentStep,
+                            step_start_time: vehicle.stepStartTime.toISOString(),
+                            assigned_tech: vehicle.assignedTech,
+                            skipped_steps: vehicle.skippedSteps
+                        }).eq('id', vehicle.id);
+                        if (error) { failCount++; } else { successCount++; }
+                    } catch (e) {
+                        failCount++;
+                        console.warn('Supabase update failed for', vehicle.stockNumber, e.message);
+                    }
+                } else {
+                    successCount++;
+                }
+
+                results.push({ stockNumber: vehicle.stockNumber, tech: vehicle.assignedTech });
+
+                if (progressDiv) {
+                    progressDiv.textContent = `Assigning ${i + 1} / ${awaitingVehicles.length}...`;
+                }
+            }
+
+            closeAwaitingModal();
+            render();
+
+            // Build summary
+            const techCounts = {};
+            results.forEach(r => { techCounts[r.tech] = (techCounts[r.tech] || 0) + 1; });
+            const techSummary = Object.entries(techCounts).map(([t, c]) => `  • ${t}: ${c} vehicle${c > 1 ? 's' : ''}`).join('\n');
+
+            let msg = `✅ Bulk Assignment Complete!\n\n`;
+            msg += `Workflow: ${workflow.name}\n`;
+            msg += `First Step: ${firstStep}\n`;
+            msg += `Vehicles Assigned: ${awaitingVehicles.length}\n`;
+            if (supabaseClient) msg += `DB Updated: ${successCount} | Failed: ${failCount}\n`;
+            msg += `\n🔄 Tech Distribution (AI Round-Robin):\n${techSummary}`;
+            alert(msg);
         }
 
         function validateWorkflowCompletion(vehicle) {
@@ -3935,7 +5263,13 @@
                 }
             });
 
-            
+            // Persist all changed vehicles to Supabase
+            vehicles.forEach(v => {
+                if (!reassignableLocks.has(v.vin) && v.currentStep !== 'Finished') {
+                    persistVehicleState(v);
+                }
+            });
+
             render();
             alert(`✓ Auto-reassignment complete!\n\n${reassignCount} total changes:\n• ${stepChangeCount} step changes\n• ${techChangeCount} technician changes`);
         }
@@ -4153,7 +5487,7 @@ ${baseDirectory}/
             }
 
             // Admin has full control
-            if (currentUser.role === 'administrator') {
+            if (isAdmin()) {
                 showAdminVehicleDialog(vehicle);
             }
         }
@@ -4511,6 +5845,7 @@ ${baseDirectory}/
                 id: Date.now() + Math.random()
             });
             
+            persistVehicleState(vehicle);
             closeDialog();
             render();
             alert(`✓ Vehicle moved to ${newStep}`);
@@ -4547,7 +5882,8 @@ ${baseDirectory}/
                 if (newStep === 'Finished') {
                     saveVehicleToHistory(vehicle);
                 }
-                
+
+                persistVehicleState(vehicle);
                 closeDialog();
                 render();
                 alert(`Vehicle ${vehicle.stockNumber || vin} moved to ${newStep}`);
@@ -4613,12 +5949,12 @@ ${baseDirectory}/
             }
         }
 
-        function addNewVehicle() {
-            const vin = document.getElementById('newVIN').value;
-            const stockNumber = document.getElementById('newStockNumber').value;
+        async function addNewVehicle(forceAdd = false) {
+            const vin = document.getElementById('newVIN').value.trim().toUpperCase();
+            const stockNumber = document.getElementById('newStockNumber').value.trim().toUpperCase();
             const year = document.getElementById('newYear').value;
-            const make = document.getElementById('newMake').value;
-            const model = document.getElementById('newModel').value;
+            const make = document.getElementById('newMake').value.trim();
+            const model = document.getElementById('newModel').value.trim();
             const miles = parseInt(document.getElementById('newMiles').value) || 0;
             const skipStepsSelect = document.getElementById('skipSteps');
             const skippedSteps = Array.from(skipStepsSelect.selectedOptions).map(opt => opt.value);
@@ -4627,46 +5963,196 @@ ${baseDirectory}/
                 alert('Please enter a VIN');
                 return;
             }
+            
+            if (!stockNumber) {
+                alert('Please enter a Stock Number');
+                return;
+            }
+            
+            // Check for duplicate stock number (only if not forcing)
+            if (!forceAdd && supabaseClient && currentLocationId) {
+                try {
+                    const { data: existingStock, error: stockError } = await supabaseClient
+                        .from('vehicles')
+                        .select('id, vin, year, make, model, current_step, workflow')
+                        .eq('location_id', currentLocationId)
+                        .eq('stock_number', stockNumber)
+                        .maybeSingle();
+                    
+                    if (existingStock) {
+                        // Check if user is admin or super admin
+                        const canOverride = currentUser && (currentUser.role === 'administrator' || currentUser.role === 'superadmin');
+                        
+                        if (canOverride) {
+                            // Admin can choose to delete old and add new
+                            const choice = confirm(`⚠️ DUPLICATE STOCK NUMBER DETECTED!
 
+Stock # "${stockNumber}" already exists:
+
+VIN: ${existingStock.vin}
+Vehicle: ${existingStock.year} ${existingStock.make} ${existingStock.model}
+Workflow: ${existingStock.workflow || 'None'}
+Current Step: ${existingStock.current_step}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+As an administrator, you can:
+
+✅ REPLACE the old vehicle with this new one
+   (Old vehicle will be deleted)
+
+❌ CANCEL and use a different stock number
+
+Click OK to REPLACE the old vehicle.
+Click Cancel to stop.`);
+                            
+                            if (!choice) {
+                                return; // User cancelled
+                            }
+                            
+                            // Delete the old vehicle first
+                            const { error: deleteError } = await supabaseClient
+                                .from('vehicles')
+                                .delete()
+                                .eq('id', existingStock.id);
+                            
+                            if (deleteError) {
+                                alert('Error removing old vehicle: ' + deleteError.message);
+                                return;
+                            }
+                            
+                            console.log('✅ Old vehicle deleted, proceeding with new addition');
+                            // Continue to add new vehicle below
+                            
+                        } else {
+                            // Not an admin - cannot override
+                            alert(`❌ DUPLICATE STOCK NUMBER!
+
+Stock # "${stockNumber}" already exists at this location:
+
+VIN: ${existingStock.vin}
+Vehicle: ${existingStock.year} ${existingStock.make} ${existingStock.model}
+Current Step: ${existingStock.current_step}
+
+You do not have permission to override duplicates.
+Please use a different stock number or contact an administrator.`);
+                            return;
+                        }
+                    }
+                    
+                } catch (err) {
+                    console.log('Duplicate check complete, proceeding...');
+                }
+            }
+            
+            // Create vehicle object
             const newVehicle = {
+                location_id: currentLocationId,
                 vin: vin,
-                stockNumber: stockNumber,
+                stock_number: stockNumber,
                 year: year,
                 make: make,
                 model: model,
                 miles: miles,
-                entryTime: new Date(),
-                currentStep: 'Awaiting Arrival',
-                stepStartTime: new Date(),
-                completedSteps: [],
-                skippedSteps: skippedSteps,
-                assignedTech: 'unassigned',
-                tags: skippedSteps.map(s => `Skip ${s}`),
-                vehicleTags: [],
-                notes: '',
-                noteHistory: [
-                    { text: 'Vehicle added to system - awaiting arrival and workflow assignment', timestamp: new Date(), user: currentUser ? currentUser.username : 'admin', id: Date.now() }
-                ],
-                photos: [],
-                stepHistory: [],
+                entry_time: new Date().toISOString(),
+                current_step: 'Awaiting Arrival',
+                step_start_time: new Date().toISOString(),
+                completed_steps: [],
+                assigned_tech: null,
+                tags: [],
+                vehicle_tags: skippedSteps.map(s => `Skip ${s}`),
+                appraisal_notes: 'Vehicle added to system - awaiting arrival',
                 workflow: 'AWAITING'
             };
+            
+            // Insert into Supabase
+            if (supabaseClient) {
+                try {
+                    const { data, error } = await supabaseClient
+                        .from('vehicles')
+                        .insert(newVehicle)
+                        .select()
+                        .single();
+                    
+                    if (error) {
+                        if (error.code === '23505') {
+                            alert(`❌ Database Rejected: Duplicate Stock Number!
 
-            vehicles.push(newVehicle);
-            if (stockNumber) stockNumberRegistry.add(stockNumber);
-            
-            // Clear form
-            document.getElementById('newVIN').value = '';
-            document.getElementById('newStockNumber').value = '';
-            document.getElementById('newYear').value = '';
-            document.getElementById('newMake').value = '';
-            document.getElementById('newModel').value = '';
-            document.getElementById('newMiles').value = '';
-            skipStepsSelect.selectedIndex = -1;
-            
-            
-            render();
-            alert(`✓ Vehicle ${stockNumber || vin} added to "Awaiting Arrival". Assign a workflow when the vehicle arrives.`);
+Stock # "${stockNumber}" already exists at this location.
+
+Each stock number must be unique per location.
+
+Please use a different stock number.`);
+                        } else {
+                            alert('Error adding vehicle: ' + error.message);
+                        }
+                        return;
+                    }
+                    
+                    // Success!
+                    alert(`✅ Vehicle ${stockNumber} added successfully!
+
+Vehicle is now in "Awaiting Arrival". 
+Assign a workflow when the vehicle arrives.`);
+                    
+                    // Clear form
+                    document.getElementById('newVIN').value = '';
+                    document.getElementById('newStockNumber').value = '';
+                    document.getElementById('newYear').value = '';
+                    document.getElementById('newMake').value = '';
+                    document.getElementById('newModel').value = '';
+                    document.getElementById('newMiles').value = '';
+                    if (skipStepsSelect) skipStepsSelect.selectedIndex = -1;
+                    
+                    // Reload data
+                    await loadDataFromSupabase();
+                    render();
+                    
+                } catch (error) {
+                    console.error('Error:', error);
+                    alert('Error adding vehicle: ' + error.message);
+                }
+            } else {
+                // Fallback for mock mode
+                const mockVehicle = {
+                    vin: vin,
+                    stockNumber: stockNumber,
+                    year: year,
+                    make: make,
+                    model: model,
+                    miles: miles,
+                    entryTime: new Date(),
+                    currentStep: 'Awaiting Arrival',
+                    stepStartTime: new Date(),
+                    completedSteps: [],
+                    skippedSteps: skippedSteps,
+                    assignedTech: 'unassigned',
+                    tags: skippedSteps.map(s => `Skip ${s}`),
+                    vehicleTags: [],
+                    notes: '',
+                    noteHistory: [
+                        { text: 'Vehicle added to system - awaiting arrival and workflow assignment', timestamp: new Date(), user: currentUser ? currentUser.username : 'admin', id: Date.now() }
+                    ],
+                    photos: [],
+                    stepHistory: [],
+                    workflow: 'AWAITING'
+                };
+
+                vehicles.push(mockVehicle);
+                if (stockNumber) stockNumberRegistry.add(stockNumber);
+                
+                // Clear form
+                document.getElementById('newVIN').value = '';
+                document.getElementById('newStockNumber').value = '';
+                document.getElementById('newYear').value = '';
+                document.getElementById('newMake').value = '';
+                document.getElementById('newModel').value = '';
+                document.getElementById('newMiles').value = '';
+                if (skipStepsSelect) skipStepsSelect.selectedIndex = -1;
+                
+                render();
+                alert(`✓ Vehicle ${stockNumber || vin} added to "Awaiting Arrival". Assign a workflow when the vehicle arrives.`);
+            }
         }
 
         function updateThreshold(step, value) {
@@ -4675,70 +6161,318 @@ ${baseDirectory}/
         }
 
         // Excel Import Functions
-        function handleExcelImport(event) {
+        // ── Import progress dialog helpers ──────────────────────────────
+        function showImportDialog(total) {
+            const existing = document.getElementById('importProgressDialog');
+            if (existing) existing.remove();
+
+            document.body.insertAdjacentHTML('beforeend', `
+                <div id="importProgressDialog" style="
+                    position:fixed;top:0;left:0;right:0;bottom:0;
+                    background:rgba(0,0,0,0.55);z-index:3000;
+                    display:flex;align-items:center;justify-content:center;padding:20px;">
+                    <div style="
+                        background:white;border-radius:12px;padding:28px;
+                        width:100%;max-width:480px;
+                        box-shadow:0 20px 60px rgba(0,0,0,0.3);">
+
+                        <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;">
+                            <div id="importSpinner" style="
+                                width:28px;height:28px;border-radius:50%;
+                                border:3px solid #e2e8f0;border-top-color:#4299e1;
+                                animation:spin 0.7s linear infinite;flex-shrink:0;"></div>
+                            <div>
+                                <div style="font-weight:700;font-size:16px;">Importing Vehicles</div>
+                                <div id="importStatusText" style="font-size:13px;color:#718096;margin-top:2px;">
+                                    Reading file…
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Progress bar -->
+                        <div style="background:#edf2f7;border-radius:999px;height:10px;overflow:hidden;margin-bottom:14px;">
+                            <div id="importProgressBar" style="
+                                height:100%;width:0%;
+                                background:linear-gradient(90deg,#4299e1,#48bb78);
+                                border-radius:999px;
+                                transition:width 0.25s ease;"></div>
+                        </div>
+
+                        <!-- Counters row -->
+                        <div style="display:flex;gap:10px;margin-bottom:16px;">
+                            <div style="flex:1;text-align:center;background:#f0fdf4;border-radius:8px;padding:10px;">
+                                <div id="importCountDone" style="font-size:22px;font-weight:800;color:#22543d;">0</div>
+                                <div style="font-size:11px;color:#38a169;font-weight:600;">IMPORTED</div>
+                            </div>
+                            <div style="flex:1;text-align:center;background:#fffbeb;border-radius:8px;padding:10px;">
+                                <div id="importCountSkip" style="font-size:22px;font-weight:800;color:#92400e;">0</div>
+                                <div style="font-size:11px;color:#d97706;font-weight:600;">UPDATED</div>
+                            </div>
+                            <div style="flex:1;text-align:center;background:#fff5f5;border-radius:8px;padding:10px;">
+                                <div id="importCountErr" style="font-size:22px;font-weight:800;color:#c53030;">0</div>
+                                <div style="font-size:11px;color:#e53e3e;font-weight:600;">ERRORS</div>
+                            </div>
+                        </div>
+
+                        <!-- Row log -->
+                        <div id="importLog" style="
+                            max-height:160px;overflow-y:auto;
+                            font-size:12px;font-family:monospace;
+                            background:#1a202c;color:#e2e8f0;
+                            border-radius:6px;padding:10px;
+                            line-height:1.6;"></div>
+
+                        <!-- Done button (hidden until finished) -->
+                        <button id="importDoneBtn" onclick="closeImportDialog()" style="
+                            display:none;margin-top:16px;width:100%;
+                            padding:11px;background:#48bb78;color:white;
+                            border:none;border-radius:8px;font-size:15px;
+                            font-weight:bold;cursor:pointer;">
+                            ✅ Done — Close
+                        </button>
+                    </div>
+                </div>
+                <style>
+                    @keyframes spin { to { transform: rotate(360deg); } }
+                </style>
+            `);
+        }
+
+        function updateImportDialog(done, skipped, errors, total, logLine) {
+            const pct = total > 0 ? Math.round(((done + skipped + errors) / total) * 100) : 0;
+            document.getElementById('importProgressBar').style.width = pct + '%';
+            document.getElementById('importStatusText').textContent =
+                `${done + skipped + errors} of ${total} processed (${pct}%)`;
+            document.getElementById('importCountDone').textContent = done;
+            document.getElementById('importCountSkip').textContent = skipped;
+            document.getElementById('importCountErr').textContent = errors;
+
+            if (logLine) {
+                const log = document.getElementById('importLog');
+                log.insertAdjacentHTML('beforeend', `<div>${logLine}</div>`);
+                log.scrollTop = log.scrollHeight;
+            }
+        }
+
+        function finishImportDialog(done, skipped, errors, duplicates) {
+            // Swap spinner for checkmark
+            document.getElementById('importSpinner').style.cssText =
+                'width:28px;height:28px;border-radius:50%;background:#48bb78;' +
+                'display:flex;align-items:center;justify-content:center;' +
+                'color:white;font-size:16px;flex-shrink:0;';
+            document.getElementById('importSpinner').textContent = '✓';
+            document.getElementById('importStatusText').textContent = 'Import complete!';
+            document.getElementById('importProgressBar').style.width = '100%';
+
+            const log = document.getElementById('importLog');
+            log.insertAdjacentHTML('beforeend',
+                `<div style="color:#68d391;margin-top:6px;border-top:1px solid #2d3748;padding-top:6px;">` +
+                `── Finished: ${done} added, ${skipped} updated, ${errors} errors ──</div>`
+            );
+            if (duplicates.length > 0) {
+                log.insertAdjacentHTML('beforeend',
+                    `<div style="color:#f6e05e;">Duplicates: ${duplicates.join(', ')}</div>`
+                );
+            }
+            log.scrollTop = log.scrollHeight;
+            document.getElementById('importDoneBtn').style.display = 'block';
+        }
+
+        function closeImportDialog() {
+            const d = document.getElementById('importProgressDialog');
+            if (d) d.remove();
+        }
+
+        // ── Main import handler ──────────────────────────────────────────
+        async function handleExcelImport(event) {
             const file = event.target.files[0];
             if (!file) return;
 
             const reader = new FileReader();
-            reader.onload = function(e) {
+            reader.onload = async function(e) {
                 const text = e.target.result;
-                const lines = text.split('\n');
-                const headers = lines[0].split(',');
-                
-                let importedCount = 0;
-                let skippedCount = 0;
-                let duplicates = [];
+                const lines = text.split('\n').filter(l => l.trim());
+                // lines[0] = header row
+                const dataLines = lines.slice(1);
 
-                for (let i = 1; i < lines.length; i++) {
-                    if (!lines[i].trim()) continue;
-                    
-                    const values = lines[i].split(',');
-                    const stockNumber = values[1]?.trim().replace(/"/g, '');
-                    
-                    // Skip if stock number already exists
-                    if (stockNumberRegistry.has(stockNumber)) {
-                        skippedCount++;
-                        duplicates.push(stockNumber);
-                        continue;
+                let importedCount = 0;
+                let skippedCount  = 0;
+                let errorCount    = 0;
+                let duplicates    = [];
+                const vehiclesToImport = [];
+
+                // ── Parse CSV ──
+                // Template column order: VIN, Stock Number, Year, Make, Model, Miles, Appraisal Notes, Skip Steps
+                for (const line of dataLines) {
+                    const values       = line.split(',');
+                    const vin          = values[0]?.trim().replace(/"/g, '').toUpperCase();
+                    const stockNumber  = values[1]?.trim().replace(/"/g, '').toUpperCase();
+                    const year         = values[2]?.trim().replace(/"/g, '') || '';
+                    const make         = values[3]?.trim().replace(/"/g, '') || '';
+                    const model        = values[4]?.trim().replace(/"/g, '') || '';
+                    const miles        = parseInt(values[5]?.trim()) || 0;
+                    const appraisalNotes = values[6]?.trim().replace(/"/g, '') || '';
+                    const skipSteps    = values[7]?.trim().split(';').filter(s => s) || [];
+
+                    vehiclesToImport.push({
+                        location_id:     currentLocationId,
+                        vin,
+                        stock_number:    stockNumber,
+                        year,
+                        make,
+                        model,
+                        miles,
+                        appraisal_notes: appraisalNotes,
+                        entry_time:      new Date().toISOString(),
+                        current_step:    'Awaiting Arrival',
+                        step_start_time: new Date().toISOString(),
+                        completed_steps: [],
+                        assigned_tech:   null,
+                        tags:            [],
+                        vehicle_tags:    skipSteps.map(s => `Skip ${s}`),
+                        workflow:        'AWAITING',
+                        // keep for logging only — stripped before insert
+                        _stockNumber: stockNumber
+                    });
+                }
+
+                const total = vehiclesToImport.length;
+                showImportDialog(total);
+                updateImportDialog(0, 0, 0, total, `<span style="color:#63b3ed;">📄 Parsed ${total} rows from "${file.name}"</span>`);
+
+                // Small delay so the dialog paints before heavy work
+                await new Promise(r => setTimeout(r, 80));
+
+                // ── Supabase path ──
+                if (supabaseClient && vehiclesToImport.length > 0) {
+
+                    // Step 1: find which stock numbers already exist in this location
+                    const allStockNumbers = vehiclesToImport.map(v => v.stock_number);
+                    const { data: existing } = await supabaseClient
+                        .from('vehicles')
+                        .select('id, stock_number')
+                        .eq('location_id', currentLocationId)
+                        .in('stock_number', allStockNumbers);
+
+                    const existingMap = {};
+                    if (existing) existing.forEach(r => { existingMap[r.stock_number] = r.id; });
+
+                    const toInsert = vehiclesToImport.filter(v => !existingMap[v.stock_number]);
+                    const toUpdate = vehiclesToImport.filter(v =>  existingMap[v.stock_number]);
+
+                    updateImportDialog(0, 0, 0, total,
+                        `<span style="color:#63b3ed;">📋 ${toInsert.length} new · ${toUpdate.length} to update</span>`);
+
+                    // Step 2: update existing vehicles (year, make, model, miles only — VIN/stock locked)
+                    for (const vehicle of toUpdate) {
+                        const id = existingMap[vehicle.stock_number];
+                        try {
+                            const { error } = await supabaseClient
+                                .from('vehicles')
+                                .update({
+                                    year:           vehicle.year  || undefined,
+                                    make:           vehicle.make  || undefined,
+                                    model:          vehicle.model || undefined,
+                                    miles:          vehicle.miles || undefined
+                                })
+                                .eq('id', id);
+                            if (error) throw new Error(error.message);
+                            skippedCount++;  // reusing "skipped" counter as "updated" for display
+                            updateImportDialog(importedCount, skippedCount, errorCount, total,
+                                `<span style="color:#f6ad55;">↻ ${vehicle._stockNumber} — updated (year/make/model/miles)</span>`);
+                        } catch (err) {
+                            errorCount++;
+                            updateImportDialog(importedCount, skippedCount, errorCount, total,
+                                `<span style="color:#fc8181;">✗ ${vehicle._stockNumber} — ${err.message}</span>`);
+                        }
+                        await new Promise(r => setTimeout(r, 5));
                     }
 
-                    const vin = values[0]?.trim().replace(/"/g, '');
-                    const miles = parseInt(values[2]?.trim()) || 0;
-                    const appraisalNotes = values[3]?.trim().replace(/"/g, '') || '';
-                    const skipSteps = values[4]?.trim().split(';').filter(s => s) || [];
+                    // Step 3: batch insert new vehicles
+                    const BATCH = 25;
+                    for (let i = 0; i < toInsert.length; i += BATCH) {
+                        const batch = toInsert.slice(i, i + BATCH);
+                        const batchData = batch.map(({ _stockNumber, ...v }) => v);
+                        try {
+                            const { error } = await supabaseClient
+                                .from('vehicles')
+                                .insert(batchData);
+                            if (error) {
+                                if (error.code === '23505') {
+                                    // Race condition — row appeared between check and insert, treat as update
+                                    for (const v of batch) {
+                                        errorCount++;
+                                        updateImportDialog(importedCount, skippedCount, errorCount, total,
+                                            `<span style="color:#fc8181;">✗ ${v._stockNumber} — conflict, skipped</span>`);
+                                    }
+                                } else {
+                                    errorCount += batch.length;
+                                    updateImportDialog(importedCount, skippedCount, errorCount, total,
+                                        `<span style="color:#fc8181;">✗ Batch error — ${error.message}</span>`);
+                                }
+                            } else {
+                                importedCount += batch.length;
+                                const nums = batch.map(v => v._stockNumber).join(', ');
+                                updateImportDialog(importedCount, skippedCount, errorCount, total,
+                                    `<span style="color:#68d391;">✓ Added: ${nums}</span>`);
+                            }
+                        } catch (err) {
+                            errorCount += batch.length;
+                            updateImportDialog(importedCount, skippedCount, errorCount, total,
+                                `<span style="color:#fc8181;">✗ Batch exception — ${err.message}</span>`);
+                        }
+                        await new Promise(r => setTimeout(r, 10));
+                    }
 
-                    const firstStep = STEPS.find(s => !skipSteps.includes(s) && s !== 'Quality Control' && s !== 'Finished');
+                    updateImportDialog(importedCount, skippedCount, errorCount, total,
+                        `<span style="color:#63b3ed;">🔄 Reloading data…</span>`);
+                    await loadDataFromSupabase();
+                    render();
 
-                    const newVehicle = {
-                        vin: vin,
-                        stockNumber: stockNumber,
-                        miles: miles,
-                        appraisalNotes: appraisalNotes,
-                        entryTime: new Date(),
-                        currentStep: firstStep,
-                        stepStartTime: new Date(),
-                        completedSteps: [],
-                        skippedSteps: skipSteps,
-                        assignedTech: assignTechnician(firstStep),
-                        tags: skipSteps.map(s => `Skip ${s}`),
-                        notes: '',
-                        photos: [],
-                        stepHistory: []
-                    };
-
-                    vehicles.push(newVehicle);
-                    stockNumberRegistry.add(stockNumber);
-                    importedCount++;
+                } else {
+                    // ── Mock / offline path ──
+                    for (const vehicle of vehiclesToImport) {
+                        const existing = vehicles.find(v => v.stockNumber === vehicle.stock_number);
+                        if (existing) {
+                            // Update year/make/model/miles only — VIN and stock stay locked
+                            if (vehicle.year)  existing.year  = vehicle.year;
+                            if (vehicle.make)  existing.make  = vehicle.make;
+                            if (vehicle.model) existing.model = vehicle.model;
+                            if (vehicle.miles) existing.miles = vehicle.miles;
+                            skippedCount++;
+                            updateImportDialog(importedCount, skippedCount, errorCount, total,
+                                `<span style="color:#f6ad55;">↻ ${vehicle._stockNumber} — updated (year/make/model/miles)</span>`);
+                        } else {
+                            vehicles.push({
+                                vin:             vehicle.vin,
+                                stockNumber:     vehicle.stock_number,
+                                year:            vehicle.year,
+                                make:            vehicle.make,
+                                model:           vehicle.model,
+                                miles:           vehicle.miles,
+                                appraisalNotes:  vehicle.appraisal_notes,
+                                entryTime:       new Date(),
+                                currentStep:     'Awaiting Arrival',
+                                stepStartTime:   new Date(),
+                                completedSteps:  [],
+                                skippedSteps:    vehicle.vehicle_tags.map(t => t.replace('Skip ', '')),
+                                assignedTech:    'unassigned',
+                                tags:            vehicle.vehicle_tags,
+                                notes: '', photos: [], stepHistory: [],
+                                workflow: 'AWAITING'
+                            });
+                            stockNumberRegistry.add(vehicle.stock_number);
+                            importedCount++;
+                            updateImportDialog(importedCount, skippedCount, errorCount, total,
+                                `<span style="color:#68d391;">✓ ${vehicle._stockNumber}</span>`);
+                        }
+                        await new Promise(r => setTimeout(r, 5));
+                    }
+                    render();
                 }
 
                 event.target.value = ''; // Reset file input
-                render();
-                
-                let message = `✓ Imported ${importedCount} vehicles`;
-                if (skippedCount > 0) {
-                    message += `\n⚠️ Skipped ${skippedCount} duplicates: ${duplicates.join(', ')}`;
-                }
-                alert(message);
+                finishImportDialog(importedCount, skippedCount, errorCount, duplicates);
             };
             reader.readAsText(file);
         }
@@ -4941,12 +6675,25 @@ ${baseDirectory}/
             }
 
             let tabs = '';
-            if (currentUser.role === 'administrator') {
+            if (isAdmin() || currentUser.role === 'superadmin') {
                 tabs = `
-                    <div class="tabs">
-                        <button class="tab ${currentView === 'dashboard' ? 'active' : ''}" onclick="switchView('dashboard')">Dashboard</button>
-                        <button class="tab ${currentView === 'admin' ? 'active' : ''}" onclick="switchView('admin')">Admin Panel</button>
-                        <button class="tab ${currentView === 'reporting' ? 'active' : ''}" onclick="switchView('reporting')">Reports</button>
+                    <div class="tabs" style="justify-content:space-between;align-items:center;">
+                        <div style="display:flex;gap:5px;flex-wrap:wrap;">
+                            <button class="tab ${currentView === 'dashboard' ? 'active' : ''}" onclick="switchView('dashboard')">Dashboard</button>
+                            <button class="tab ${currentView === 'admin' ? 'active' : ''}" onclick="switchView('admin')">Admin Panel</button>
+                            <button class="tab ${currentView === 'reporting' ? 'active' : ''}" onclick="switchView('reporting')">Reports</button>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:6px;margin-left:10px;">
+                            <div style="position:relative;display:flex;align-items:center;">
+                                <span style="position:absolute;left:10px;color:#a0aec0;font-size:14px;pointer-events:none;">🔍</span>
+                                <input id="globalSearch" type="text" placeholder="Search vehicles… (Enter)"
+                                    onkeydown="if(event.key==='Enter' && this.value.trim()) runGlobalSearch(this.value)"
+                                    style="padding:7px 12px 7px 32px;border:2px solid #cbd5e0;border-radius:6px;font-size:13px;outline:none;width:220px;transition:border-color 0.2s;"
+                                    onfocus="this.style.borderColor='#4299e1'"
+                                    onblur="this.style.borderColor='#cbd5e0'"
+                                >
+                            </div>
+                        </div>
                     </div>
                 `;
             } else if (currentUser.role === 'technician') {
@@ -5150,6 +6897,124 @@ ${baseDirectory}/
         window.clearAllData = clearAllData;
         window.exportData = exportData;
 
+        // ==================== GLOBAL SEARCH ====================
+
+        function runGlobalSearch(query) {
+            const q = (query || '').trim().toLowerCase();
+            if (!q) return;
+
+            const matches = vehicles.filter(v =>
+                (v.vin         || '').toLowerCase().includes(q) ||
+                (v.stockNumber || v.stock_number || '').toLowerCase().includes(q) ||
+                (v.make        || '').toLowerCase().includes(q) ||
+                (v.model       || '').toLowerCase().includes(q) ||
+                (v.year        || '').toString().includes(q) ||
+                ((v.year||'') + ' ' + (v.make||'') + ' ' + (v.model||'')).toLowerCase().includes(q)
+            );
+
+            const stepColor = s => (!s || s === 'Awaiting Arrival') ? '#a0aec0' : s === 'Finished' ? '#48bb78' : '#4299e1';
+
+            function hl(text) {
+                if (!text) return '—';
+                const str = String(text);
+                const idx = str.toLowerCase().indexOf(q);
+                if (idx === -1) return str;
+                return str.slice(0, idx)
+                    + '<mark style="background:#fef08a;padding:0 2px;border-radius:2px;">'
+                    + str.slice(idx, idx + q.length) + '</mark>'
+                    + str.slice(idx + q.length);
+            }
+
+            // Remove existing modal if any
+            const existing = document.getElementById('searchModal');
+            if (existing) existing.remove();
+
+            const rows = matches.length === 0
+                ? '<div style="padding:40px;text-align:center;color:#718096;">No vehicles found for <strong>&quot;' + query + '&quot;</strong></div>'
+                : matches.map(v => {
+                    const stock = v.stockNumber || v.stock_number || '—';
+                    const vin   = v.vin || '—';
+                    const ymm   = [v.year, v.make, v.model].filter(Boolean).join(' ') || '—';
+                    const step  = v.currentStep || v.current_step || 'Unknown';
+                    const tech  = v.assignedTech || v.assigned_tech;
+                    const miles = v.miles ? v.miles.toLocaleString() + ' mi' : '';
+                    const color = stepColor(step);
+                    const safeVin = vin.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+                    return '<tr onclick="closeSearchModal();openSearchResult(\'' + safeVin + '\')"'
+                        + ' style="cursor:pointer;border-bottom:1px solid #f0f4f8;transition:background 0.12s;"'
+                        + ' onmouseenter="this.style.background=\'#ebf8ff\'" onmouseleave="this.style.background=\'\'">'
+                        + '<td style="padding:10px 14px;font-weight:600;font-size:13px;">' + hl(ymm) + '</td>'
+                        + '<td style="padding:10px 8px;font-family:monospace;font-size:12px;color:#4a5568;">' + hl(stock) + '</td>'
+                        + '<td style="padding:10px 8px;font-family:monospace;font-size:11px;color:#718096;">' + hl(vin) + '</td>'
+                        + '<td style="padding:10px 8px;font-size:12px;color:#718096;">' + (miles || '—') + '</td>'
+                        + '<td style="padding:10px 8px;font-size:12px;color:#4299e1;">' + (tech || '—') + '</td>'
+                        + '<td style="padding:10px 14px;">'
+                        + '<span style="padding:3px 10px;border-radius:10px;font-size:11px;font-weight:700;white-space:nowrap;'
+                        + 'background:' + color + '22;color:' + color + ';">' + step + '</span>'
+                        + '</td></tr>';
+                }).join('');
+
+            const count = matches.length;
+            const modal = document.createElement('div');
+            modal.id = 'searchModal';
+            modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.55);z-index:2000;display:flex;align-items:flex-start;justify-content:center;padding:60px 20px 20px;';
+            modal.innerHTML =
+                '<div style="background:white;border-radius:12px;width:100%;max-width:900px;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,0.3);">'
+                + '<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:2px solid #e2e8f0;flex-shrink:0;">'
+                + '<div style="display:flex;align-items:center;gap:12px;flex:1;">'
+                + '<span style="font-size:18px;">🔍</span>'
+                + '<input id="searchModalInput" type="text" value="' + query.replace(/"/g,'&quot;') + '"'
+                + ' placeholder="Search VIN, stock, make, model, year…"'
+                + ' onkeydown="if(event.key===\'Enter\') runGlobalSearch(this.value); if(event.key===\'Escape\') closeSearchModal();"'
+                + ' style="flex:1;border:none;outline:none;font-size:16px;font-weight:500;">'
+                + '<span style="font-size:13px;color:#718096;white-space:nowrap;">' + count + ' result' + (count !== 1 ? 's' : '') + '</span>'
+                + '</div>'
+                + '<button onclick="closeSearchModal()" style="margin-left:16px;background:#f0f4f8;border:none;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px;color:#4a5568;">✕ Close</button>'
+                + '</div>'
+                + '<div style="overflow-y:auto;flex:1;">'
+                + (matches.length > 0
+                    ? '<table style="width:100%;border-collapse:collapse;">'
+                      + '<thead><tr style="background:#f7fafc;font-size:11px;color:#718096;text-transform:uppercase;letter-spacing:0.05em;">'
+                      + '<th style="padding:8px 14px;text-align:left;font-weight:600;">Vehicle</th>'
+                      + '<th style="padding:8px 8px;text-align:left;font-weight:600;">Stock #</th>'
+                      + '<th style="padding:8px 8px;text-align:left;font-weight:600;">VIN</th>'
+                      + '<th style="padding:8px 8px;text-align:left;font-weight:600;">Miles</th>'
+                      + '<th style="padding:8px 8px;text-align:left;font-weight:600;">Tech</th>'
+                      + '<th style="padding:8px 14px;text-align:left;font-weight:600;">Step</th>'
+                      + '</tr></thead><tbody>' + rows + '</tbody></table>'
+                    : rows)
+                + '</div>'
+                + '<div style="padding:10px 20px;border-top:1px solid #e2e8f0;font-size:11px;color:#a0aec0;flex-shrink:0;">Press Enter to search · Esc to close · Click a row to open vehicle</div>'
+                + '</div>';
+
+            document.body.appendChild(modal);
+            modal.addEventListener('click', e => { if (e.target === modal) closeSearchModal(); });
+
+            // Focus the modal input and select all
+            setTimeout(() => {
+                const mi = document.getElementById('searchModalInput');
+                if (mi) { mi.focus(); mi.select(); }
+            }, 30);
+        }
+
+        function closeSearchModal() {
+            const m = document.getElementById('searchModal');
+            if (m) m.remove();
+        }
+
+        function openSearchResult(vin) {
+            closeSearchModal();
+            if (currentView !== 'dashboard') {
+                currentView = 'dashboard';
+                render();
+                setTimeout(() => showVehicleDetails(vin), 50);
+            } else {
+                showVehicleDetails(vin);
+            }
+        }
+
+        // ==================== END GLOBAL SEARCH ====================
+
         // Initialize - check for existing session
         async function init() {
             if (USE_SUPABASE && supabaseClient) {
@@ -5164,5 +7029,35 @@ ${baseDirectory}/
         
         init();
     </script>
+    <!-- Add Location Modal -->
+    <div id="addLocationModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
+        <div style="background: white; padding: 30px; border-radius: 8px; max-width: 500px; width: 90%;">
+            <h3 style="margin-bottom: 20px;">Add New Location</h3>
+            <div style="margin-bottom: 15px;">
+                <label style="display: block; margin-bottom: 5px; font-weight: bold;">Location Name *</label>
+                <input type="text" id="newLocationName" placeholder="Miami Store" style="width: 100%; padding: 8px; border: 2px solid #cbd5e0; border-radius: 4px;">
+            </div>
+            <div style="margin-bottom: 15px;">
+                <label style="display: block; margin-bottom: 5px; font-weight: bold;">Address</label>
+                <input type="text" id="newLocationAddress" placeholder="123 Main St" style="width: 100%; padding: 8px; border: 2px solid #cbd5e0; border-radius: 4px;">
+            </div>
+            <div style="margin-bottom: 15px;">
+                <label style="display: block; margin-bottom: 5px; font-weight: bold;">City *</label>
+                <input type="text" id="newLocationCity" placeholder="Miami" style="width: 100%; padding: 8px; border: 2px solid #cbd5e0; border-radius: 4px;">
+            </div>
+            <div style="margin-bottom: 15px;">
+                <label style="display: block; margin-bottom: 5px; font-weight: bold;">State *</label>
+                <input type="text" id="newLocationState" placeholder="FL" maxlength="2" style="width: 100%; padding: 8px; border: 2px solid #cbd5e0; border-radius: 4px;">
+            </div>
+            <div style="display: flex; gap: 10px; margin-top: 20px;">
+                <button class="btn" onclick="saveNewLocation()" style="flex: 1; background: #48bb78;">
+                    ✅ Save Location
+                </button>
+                <button class="btn" onclick="closeAddLocationModal()" style="flex: 1; background: #718096;">
+                    ❌ Cancel
+                </button>
+            </div>
+        </div>
+    </div>
 </body>
 </html>
