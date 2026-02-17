@@ -1818,18 +1818,18 @@
             return bestAlternate ? bestAlternate.step : null;
         }
 
-        function reassignVehicle(vin, newTech) {
+        async function reassignVehicle(vin, newTech) {
             const vehicle = vehicles.find(v => v.vin === vin);
             if (vehicle) {
                 vehicle.assignedTech = newTech;
-                vehicle.stepStartTime = new Date(); // Reset timer
-                
+                vehicle.stepStartTime = new Date();
+                await persistVehicleState(vehicle);
                 render();
                 alert(`✓ Vehicle ${vehicle.stockNumber || vin} reassigned to ${newTech}`);
             }
         }
 
-        function moveToSuggestedStep(vin, newStep) {
+        async function moveToSuggestedStep(vin, newStep) {
             const vehicle = vehicles.find(v => v.vin === vin);
             if (vehicle) {
                 // Safety check: Don't allow moving to QC or Finished without all steps completed
@@ -1859,7 +1859,7 @@
                 vehicle.stepStartTime = new Date();
                 vehicle.assignedTech = assignTechnician(newStep);
 
-                persistVehicleState(vehicle);
+                await persistVehicleState(vehicle);
                 render();
                 alert(`✓ Vehicle ${vehicle.stockNumber || vin} moved to ${newStep}`);
             }
@@ -1867,24 +1867,41 @@
 
         // ── Persist vehicle state to Supabase after any step change ──
         async function persistVehicleState(vehicle) {
-            if (!supabaseClient || !vehicle.id) return;
+            if (!supabaseClient || !vehicle.id) {
+                console.warn('persistVehicleState: skipped — no supabaseClient or vehicle.id', vehicle?.stockNumber);
+                return;
+            }
             try {
-                await supabaseClient.from('vehicles').update({
-                    current_step:     vehicle.currentStep,
-                    step_start_time:  vehicle.stepStartTime instanceof Date
-                                        ? vehicle.stepStartTime.toISOString()
-                                        : vehicle.stepStartTime,
-                    assigned_tech:    vehicle.assignedTech,
-                    completed_steps:  vehicle.completedSteps,
-                    skipped_steps:    vehicle.skippedSteps,
-                    workflow:         vehicle.workflow
-                }).eq('id', vehicle.id);
+                const { data, error } = await supabaseClient
+                    .from('vehicles')
+                    .update({
+                        current_step:     vehicle.currentStep,
+                        step_start_time:  vehicle.stepStartTime instanceof Date
+                                            ? vehicle.stepStartTime.toISOString()
+                                            : vehicle.stepStartTime,
+                        assigned_tech:    vehicle.assignedTech,
+                        completed_steps:  vehicle.completedSteps,
+                        skipped_steps:    vehicle.skippedSteps,
+                        workflow:         vehicle.workflow
+                    })
+                    .eq('id', vehicle.id)
+                    .select('id');
+
+                if (error) {
+                    console.error('persistVehicleState DB error:', error.message, '| vehicle:', vehicle.stockNumber);
+                    alert('⚠️ Save failed for ' + (vehicle.stockNumber || vehicle.vin) + ': ' + error.message);
+                } else if (!data || data.length === 0) {
+                    console.error('persistVehicleState: 0 rows updated — RLS is blocking UPDATE. Vehicle:', vehicle.stockNumber, 'id:', vehicle.id);
+                    alert('⚠️ Save blocked for ' + (vehicle.stockNumber || vehicle.vin) + '.\n\nYour Supabase RLS policy is blocking UPDATE on the vehicles table.\n\nRun this in your Supabase SQL editor to fix it:\n\nCREATE POLICY \"Allow authenticated updates\"\nON vehicles FOR UPDATE\nUSING (auth.uid() IS NOT NULL);');
+                } else {
+                    console.log('✅ Saved:', vehicle.stockNumber, '→', vehicle.currentStep);
+                }
             } catch (e) {
-                console.warn('persistVehicleState failed:', e.message);
+                console.error('persistVehicleState exception:', e.message);
             }
         }
 
-        function completeStep(vehicle) {
+        async function completeStep(vehicle) {
             // Mark current step as complete
             vehicle.completedSteps.push(vehicle.currentStep);
             
@@ -1930,11 +1947,11 @@
                 technicianStatus[newTech].currentVehicle = vehicle.vin;
             }
 
-            persistVehicleState(vehicle);
+            await persistVehicleState(vehicle);
             render();
         }
 
-        function rejectFromQC(vehicle, sendBackTo) {
+        async function rejectFromQC(vehicle, sendBackTo) {
             // Remove the step from completed so it needs to be done again
             const index = vehicle.completedSteps.indexOf(sendBackTo);
             if (index > -1) {
@@ -1945,7 +1962,7 @@
             vehicle.stepStartTime = new Date();
             vehicle.assignedTech = assignTechnician(sendBackTo);
 
-            persistVehicleState(vehicle);
+            await persistVehicleState(vehicle);
             render();
         }
 
@@ -5228,7 +5245,7 @@
         }
 
         // Auto-reassign logic with ML-like optimization
-        function autoReassignAll() {
+        async function autoReassignAll() {
             if (!confirm('Auto-reassign will analyze all vehicles and optimize assignments based on:\n• Queue lengths\n• Technician availability\n• Historical completion times\n\nProceed?')) {
                 return;
             }
@@ -5264,11 +5281,10 @@
             });
 
             // Persist all changed vehicles to Supabase
-            vehicles.forEach(v => {
-                if (!reassignableLocks.has(v.vin) && v.currentStep !== 'Finished') {
-                    persistVehicleState(v);
-                }
-            });
+            await Promise.all(vehicles
+                .filter(v => !reassignableLocks.has(v.vin) && v.currentStep !== 'Finished')
+                .map(v => persistVehicleState(v))
+            );
 
             render();
             alert(`✓ Auto-reassignment complete!\n\n${reassignCount} total changes:\n• ${stepChangeCount} step changes\n• ${techChangeCount} technician changes`);
@@ -5827,7 +5843,7 @@ ${baseDirectory}/
             if (selectedBtn) selectedBtn.classList.add('active');
         }
         
-        function moveVehicleToStepFromDialog(vin) {
+        async function moveVehicleToStepFromDialog(vin) {
             const newStep = document.getElementById(`moveToStep_${vin}`).value;
             const vehicle = vehicles.find(v => v.vin === vin);
             if (!vehicle) return;
@@ -5845,7 +5861,7 @@ ${baseDirectory}/
                 id: Date.now() + Math.random()
             });
             
-            persistVehicleState(vehicle);
+            await persistVehicleState(vehicle);
             closeDialog();
             render();
             alert(`✓ Vehicle moved to ${newStep}`);
@@ -5856,7 +5872,7 @@ ${baseDirectory}/
             if (dialog) dialog.remove();
         }
 
-        function moveVehicleToStep(vin) {
+        async function moveVehicleToStep(vin) {
             const vehicle = vehicles.find(v => v.vin === vin);
             const newStep = document.getElementById('moveToStep').value;
             
@@ -5883,27 +5899,27 @@ ${baseDirectory}/
                     saveVehicleToHistory(vehicle);
                 }
 
-                persistVehicleState(vehicle);
+                await persistVehicleState(vehicle);
                 closeDialog();
                 render();
                 alert(`Vehicle ${vehicle.stockNumber || vin} moved to ${newStep}`);
             }
         }
 
-        function adminCompleteStep(vin) {
+        async function adminCompleteStep(vin) {
             const vehicle = vehicles.find(v => v.vin === vin);
             if (vehicle) {
-                completeStep(vehicle);
+                await completeStep(vehicle);
                 closeDialog();
                 render();
                 alert(`✓ ${vehicle.completedSteps[vehicle.completedSteps.length - 1]} completed for ${vehicle.stockNumber || vin}`);
             }
         }
 
-        function passQC(vin) {
+        async function passQC(vin) {
             const vehicle = vehicles.find(v => v.vin === vin);
             if (vehicle) {
-                completeStep(vehicle);
+                await completeStep(vehicle);
                 closeDialog();
                 render();
                 alert(`✓ Quality Control passed - Vehicle moved to Finished`);
@@ -5937,12 +5953,12 @@ ${baseDirectory}/
             document.body.insertAdjacentHTML('beforeend', dialogHTML);
         }
 
-        function rejectVehicle(vin) {
+        async function rejectVehicle(vin) {
             const vehicle = vehicles.find(v => v.vin === vin);
             const sendBackTo = document.getElementById('rejectToStep').value;
             
             if (vehicle && sendBackTo) {
-                rejectFromQC(vehicle, sendBackTo);
+                await rejectFromQC(vehicle, sendBackTo);
                 closeDialog();
                 render();
                 alert(`Vehicle ${vehicle.stockNumber || vin} sent back to ${sendBackTo}`);
