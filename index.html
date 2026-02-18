@@ -258,7 +258,7 @@
         }
 
         .step-btn {
-            background: #4caf50;
+            background: #805ad5;
             color: white;
             border: none;
             padding: 6px 12px;
@@ -270,7 +270,7 @@
         }
 
         .step-btn:hover {
-            background: #45a049;
+            background: #6b46c1;
         }
 
         .admin-tabs {
@@ -980,10 +980,16 @@
         const USE_SUPABASE = SUPABASE_URL && SUPABASE_ANON_KEY;
         
         // Wait for page to load before initializing
-        document.addEventListener('DOMContentLoaded', function() {
+        document.addEventListener('DOMContentLoaded', async function() {
             if (USE_SUPABASE && typeof window.supabase !== 'undefined') {
                 try {
-                    supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+                    supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+                        auth: {
+                            persistSession: true,
+                            autoRefreshToken: true,
+                            detectSessionInUrl: false
+                        }
+                    });
                     console.log('✅ Supabase initialized');
                 } catch (error) {
                     console.error('❌ Failed to initialize Supabase:', error);
@@ -991,6 +997,8 @@
             } else {
                 console.log('⚠️ Using mock authentication (Supabase not configured)');
             }
+            // Run init here so supabaseClient is ready
+            await init();
         });
 
         
@@ -1158,11 +1166,14 @@
                 .eq('location_id', userLocation.id);
             
             if (data) {
-                technicians = data.map(t => ({
-                    name: t.name,
-                    department: t.department,
-                    status: t.status || 'available'
-                }));
+                // Convert flat array → step-keyed object: { 'Detail': ['John','Jane'], ... }
+                technicians = {};
+                data.forEach(t => {
+                    const dept = t.department;
+                    if (!dept) return;
+                    if (!technicians[dept]) technicians[dept] = [];
+                    if (!technicians[dept].includes(t.name)) technicians[dept].push(t.name);
+                });
             }
         }
         
@@ -1213,6 +1224,7 @@
         let currentUser = null;
         let currentView = 'dashboard';
         let selectedStepFilter = 'all'; // New filter state
+        let selectedTechFilter = 'all'; // Filter by technician
         let selectedStatFilter = 'all'; // Filter by stat card (all, inProgress, completed, overdue, suggested)
         let currentAdminTab = 'import'; // Admin panel tabs
         let expandedSteps = new Set(); // Track which steps are expanded to show substeps
@@ -1525,36 +1537,20 @@
         let lastAssignment = {}; // Track last assignment per step
         let technicianStatus = {}; // Track if technician is currently working or available
 
-        // Initialize technician status
+        // Initialize technician status — technicians is always a step-keyed object
         function initTechnicianStatus() {
-            // Handle both old format (object by step) and new format (array of tech objects)
-            if (Array.isArray(technicians)) {
-                // New format from Supabase
-                technicians.forEach(tech => {
-                    const techName = tech.name || tech;
-                    if (!technicianStatus[techName]) {
-                        technicianStatus[techName] = {
+            Object.entries(technicians).forEach(([step, techs]) => {
+                (techs || []).forEach(tech => {
+                    if (!technicianStatus[tech]) {
+                        technicianStatus[tech] = {
                             currentVehicle: null,
                             available: true,
                             lastCompleted: null
                         };
                     }
                 });
-            } else {
-                // Old format (object by step)
-                Object.entries(technicians).forEach(([step, techs]) => {
-                    techs.forEach(tech => {
-                        if (!technicianStatus[tech]) {
-                            technicianStatus[tech] = {
-                                currentVehicle: null,
-                                available: true,
-                                lastCompleted: null
-                            };
-                        }
-                    });
-                });
-            }
-            
+            });
+
             // Set current assignments based on vehicles
             vehicles.forEach(v => {
                 if (v.assignedTech && technicianStatus[v.assignedTech]) {
@@ -1742,50 +1738,51 @@
             const techList = technicians[step] || [];
             if (techList.length === 0) return null;
 
-            // Round robin - find next technician
-            const lastTech = lastAssignment[step] || null;
-            const lastIndex = lastTech ? techList.indexOf(lastTech) : -1;
-            const nextIndex = (lastIndex + 1) % techList.length;
-            
-            const assignedTech = techList[nextIndex];
-            lastAssignment[step] = assignedTech;
-            
-            return assignedTech;
+            // Count current assignments per tech across ALL steps (total workload)
+            const counts = {};
+            techList.forEach(t => { counts[t] = 0; });
+            vehicles.forEach(v => {
+                if (v.currentStep !== 'Finished' && v.assignedTech && counts.hasOwnProperty(v.assignedTech)) {
+                    counts[v.assignedTech]++;
+                }
+            });
+
+            // Pick tech with lowest total workload
+            let bestTech = techList[0];
+            let bestCount = Infinity;
+            techList.forEach(t => {
+                if (counts[t] < bestCount) {
+                    bestCount = counts[t];
+                    bestTech = t;
+                }
+            });
+            lastAssignment[step] = bestTech;
+            return bestTech;
         }
 
         function getAvailableTechnician(step) {
             const techList = technicians[step] || [];
             if (techList.length === 0) return null;
 
-            // Find technicians who don't have active assignments
-            for (let tech of techList) {
-                const hasActiveAssignment = vehicles.some(v => 
-                    v.assignedTech === tech && 
-                    v.currentStep === step && 
-                    v.currentStep !== 'Finished'
-                );
-                
-                if (!hasActiveAssignment) {
-                    return tech;
-                }
-            }
-
-            // If all are busy, return the one with oldest assignment (likely to finish soon)
-            let oldestAssignment = null;
-            let oldestTime = Date.now();
-
-            techList.forEach(tech => {
-                const vehicle = vehicles.find(v => 
-                    v.assignedTech === tech && 
-                    v.currentStep === step
-                );
-                if (vehicle && vehicle.stepStartTime < oldestTime) {
-                    oldestTime = vehicle.stepStartTime;
-                    oldestAssignment = tech;
+            // Count current assignments per tech for THIS step
+            const counts = {};
+            techList.forEach(t => { counts[t] = 0; });
+            vehicles.forEach(v => {
+                if (v.currentStep === step && v.assignedTech && counts.hasOwnProperty(v.assignedTech)) {
+                    counts[v.assignedTech]++;
                 }
             });
 
-            return oldestAssignment || techList[0];
+            // Return the tech with the fewest assignments (true load balancing)
+            let bestTech = techList[0];
+            let bestCount = Infinity;
+            techList.forEach(t => {
+                if (counts[t] < bestCount) {
+                    bestCount = counts[t];
+                    bestTech = t;
+                }
+            });
+            return bestTech;
         }
 
         function getSuggestedAlternateStep(vehicle) {
@@ -2035,6 +2032,40 @@
             `;
         }
 
+        function renderTechSummary(stepVehicles) {
+            if (!stepVehicles || stepVehicles.length === 0) return '';
+            const techMap = {};
+            stepVehicles.forEach(function(v) {
+                const t = v.assignedTech || 'Unassigned';
+                if (!techMap[t]) techMap[t] = { total: 0, overdue: 0 };
+                techMap[t].total++;
+                if (isOverdue(v)) techMap[t].overdue++;
+            });
+            const entries = Object.entries(techMap);
+            if (entries.length === 0) return '';
+            let html = '<div style="display:flex;flex-wrap:wrap;gap:5px;margin:6px 0 10px;">';
+            entries.forEach(function(entry) {
+                const tech = entry[0];
+                const stats = entry[1];
+                // If a tech filter is active and this isn't it, skip entirely
+                if (selectedTechFilter !== 'all' && selectedTechFilter !== tech) return;
+                const hasO = stats.overdue > 0;
+                const isActive = selectedTechFilter === tech;
+                const dot = '<span style="width:7px;height:7px;border-radius:50%;background:' + (hasO ? '#fc8181' : '#68d391') + ';display:inline-block;flex-shrink:0;"></span>';
+                const countBadge = '<span style="background:' + (hasO ? '#fc8181' : '#9ae6b4') + ';color:' + (hasO ? '#fff' : '#22543d') + ';border-radius:10px;padding:1px 6px;font-size:10px;margin-left:3px;">' + stats.total + '</span>';
+                const overdueBadge = hasO ? '<span style="background:#e53e3e;color:white;border-radius:10px;padding:1px 6px;font-size:10px;margin-left:2px;">⚠ ' + stats.overdue + '</span>' : '';
+                const borderColor = hasO ? '#fc8181' : '#68d391';
+                const bg = isActive ? (hasO ? '#fed7d7' : '#c6f6d5') : (hasO ? '#fff5f5' : '#f0fff4');
+                const color = hasO ? '#c53030' : '#276749';
+                const ring = isActive ? 'outline:2px solid ' + borderColor + ';outline-offset:1px;' : '';
+                const closeX = isActive ? ' <span style=\"font-size:9px;margin-left:2px;opacity:0.7;\">✕</span>' : '';
+                const escapedTech = tech.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+                html += '<span onclick="filterByTech(\'' + escapedTech + '\')" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;padding:3px 8px 3px 6px;border-radius:20px;font-size:11px;font-weight:600;background:' + bg + ';border:1.5px solid ' + borderColor + ';color:' + color + ';' + ring + 'transition:all 0.15s;" title="' + (isActive ? 'Click to clear filter' : 'Click to filter by ' + tech) + '">' + dot + ' ' + tech + countBadge + overdueBadge + closeX + '</span>';
+            });
+            html += '</div>';
+            return html;
+        }
+
         function renderDashboard() {
             const totalVehicles = vehicles.length;
             const awaitingArrival = vehicles.filter(v => !v.workflow || v.workflow === 'AWAITING').length;
@@ -2062,6 +2093,11 @@
             // Filter by workflow
             if (currentWorkflowFilter !== 'all') {
                 vehiclesToShow = vehiclesToShow.filter(v => v.workflow === currentWorkflowFilter);
+            }
+
+            // Filter by selected technician
+            if (selectedTechFilter !== 'all') {
+                vehiclesToShow = vehiclesToShow.filter(v => (v.assignedTech || 'Unassigned') === selectedTechFilter);
             }
 
             const queuesByStep = {};
@@ -2196,6 +2232,7 @@
                                     ⚠️ ${overdueVehicles.length} OVERDUE!
                                 </div>
                             ` : ''}
+                            ${renderTechSummary(stepVehicles)}
                             <div class="${selectedStepFilter !== 'all' ? 'vehicle-grid' : ''}">
                             ${stepVehicles
                                 .sort((a, b) => a.entryTime - b.entryTime) // Oldest first
@@ -2247,6 +2284,11 @@
                                         ${isAdmin() && vehicle.currentStep !== 'Finished' ? `
                                             <button class="quick-complete-btn" onclick="event.stopPropagation(); quickCompleteStep('${vehicle.vin}')">
                                                 ✓ Complete ${vehicle.currentStep}
+                                            </button>
+                                        ` : ''}
+                                        ${(currentUser && (currentUser.role === 'administrator' || currentUser.role === 'superadmin')) && vehicle.currentStep !== 'Finished' ? `
+                                            <button class="quick-complete-btn" onclick="event.stopPropagation(); pushToFinished('${vehicle.vin}')" style="background:#805ad5;margin-top:4px;">
+                                                🏁 Push to Finished
                                             </button>
                                         ` : ''}
                                         ${showStepSuggestion ? `
@@ -2348,9 +2390,6 @@
                     </button>
                     <button class="admin-tab ${currentAdminTab === 'import' ? 'active' : ''}" onclick="switchAdminTab('import')">
                         📋 Import Vehicles
-                    </button>
-                    <button class="admin-tab ${currentAdminTab === 'users' ? 'active' : ''}" onclick="switchAdminTab('users')">
-                        👤 Mock Users
                     </button>
                     <button class="admin-tab ${currentAdminTab === 'steps' ? 'active' : ''}" onclick="switchAdminTab('steps')">
                         🔧 Steps
@@ -2485,7 +2524,10 @@
                             
                             <div class="form-group" id="departmentFieldGroup">
                                 <label>Department (for technicians)</label>
-                                <input type="text" id="newUserDepartment" placeholder="Detail, Mechanical, Xpel, etc." style="width: 100%; padding: 8px; border: 2px solid #cbd5e0; border-radius: 4px;">
+                                <select id="newUserDepartment" style="width:100%;padding:9px;border:2px solid #cbd5e0;border-radius:4px;font-size:14px;">
+                                    <option value="">— None (non-technician) —</option>
+                                    ${STEPS.filter(s => s !== 'Finished').map(s => '<option value="' + s + '">' + s + '</option>').join('')}
+                                </select>
                             </div>
                             
                             <button class="btn" onclick="createNewUser(event)" style="background: #48bb78; width: 100%;">
@@ -2564,74 +2606,6 @@
                     </div>
                 </div>
 
-                <div class="admin-content ${currentAdminTab === 'users' ? 'active' : ''}">
-                    <div class="admin-section">
-                        <h2 class="section-title">👥 User Management</h2>
-                        <div style="margin-bottom: 20px;">
-                            <h3 style="font-size: 16px; margin-bottom: 10px;">Add New User</h3>
-                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
-                                <div class="form-group">
-                                    <label>Email / Username</label>
-                                    <input type="text" id="username" placeholder="admin@miami.test or admin">
-                                </div>
-                                <div class="form-group">
-                                    <label>Password</label>
-                                    <input type="password" id="newPassword" placeholder="password">
-                                </div>
-                                <div class="form-group">
-                                    <label>Full Name</label>
-                                    <input type="text" id="newUserFullName" placeholder="John Doe">
-                                </div>
-                                <div class="form-group">
-                                    <label>Role</label>
-                                    <select id="newUserRole" onchange="document.getElementById('deptField').style.display = this.value === 'technician' ? 'block' : 'none'">
-                                        <option value="technician">Technician</option>
-                                        <option value="administrator">Administrator</option>
-                                        <option value="manager">Manager</option>
-                                    </select>
-                                </div>
-                            </div>
-                            <div class="form-group" id="deptField">
-                                <label>Department (for Technicians)</label>
-                                <select id="newUserDepartment">
-                                    ${STEPS.filter(s => s !== 'Finished').map(step => 
-                                        `<option value="${step}">${step}</option>`
-                                    ).join('')}
-                                </select>
-                            </div>
-                            <button class="btn" onclick="addUser()">➕ Add User</button>
-                        </div>
-                        
-                        <h3 style="font-size: 16px; margin-bottom: 10px;">Current Users</h3>
-                        <table style="font-size: 13px;">
-                            <thead>
-                                <tr>
-                                    <th>Username</th>
-                                    <th>Name</th>
-                                    <th>Role</th>
-                                    <th>Department</th>
-                                    <th>Action</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                ${Object.entries(users).map(([username, user]) => `
-                                    <tr>
-                                        <td>${username}</td>
-                                        <td>${user.name}</td>
-                                        <td>${user.role}</td>
-                                        <td>${user.department || '-'}</td>
-                                        <td>
-                                            ${username !== 'admin' ? `
-                                                <button class="btn" onclick="removeUser('${username}')" style="background: #e53e3e; padding: 4px 8px; font-size: 11px;">
-                                                    Remove
-                                                </button>
-                                            ` : '<span style="color: #718096;">Protected</span>'}
-                                        </td>
-                                    </tr>
-                                `).join('')}
-                            </tbody>
-                        </table>
-                    </div>
                 </div>
 
                 <div class="admin-content ${currentAdminTab === 'steps' ? 'active' : ''}">
@@ -3274,10 +3248,11 @@
                 
                 // Load data for current location
                 await loadDataFromSupabase();
+                render();
                 
             } catch (err) {
                 console.error('Profile load exception:', err);
-                alert('Error: ' + err.message);
+                render(); // render login on error
             }
         }
         
@@ -3352,19 +3327,25 @@
                 const vehicleIds = vehicles.map(v => v.id);
                 const [
                     { data: workflowData },
-                    { data: techData },
+                    { data: techData,        error: techErr },
+                    { data: profileTechData, error: profileTechErr },
                     { data: thresholdData },
                     { data: tagData },
                     { data: allNotes }
                 ] = await Promise.all([
                     supabaseClient.from('workflows').select('*').eq('location_id', currentLocationId),
                     supabaseClient.from('technicians').select('*').eq('location_id', currentLocationId),
+                    supabaseClient.from('user_profiles').select('full_name, department').eq('location_id', currentLocationId).eq('role', 'technician'),
                     supabaseClient.from('step_thresholds').select('*').eq('location_id', currentLocationId),
                     supabaseClient.from('tag_definitions').select('*').eq('location_id', currentLocationId),
                     vehicleIds.length > 0
                         ? supabaseClient.from('vehicle_notes').select('*').in('vehicle_id', vehicleIds).order('created_at', { ascending: false })
                         : Promise.resolve({ data: [] })
                 ]);
+
+                console.log('📋 techData:', JSON.stringify(techData), '| error:', techErr?.message);
+                console.log('📋 profileTechData (ALL technician role users):', JSON.stringify(profileTechData), '| error:', profileTechErr?.message);
+                console.log('📋 currentLocationId:', currentLocationId);
                 
                 if (workflowData) {
                     workflows = {};
@@ -3378,14 +3359,43 @@
                     console.log(`✅ Loaded ${workflowData.length} workflows`);
                 }
                 
-                if (techData) {
-                    technicians = techData.map(t => ({
-                        name: t.name,
+                // Build technicians object from technicians table
+                technicians = {};
+                const addToTechnicians = (name, dept) => {
+                    if (!name || !dept) return;
+                    if (!technicians[dept]) technicians[dept] = [];
+                    if (!technicians[dept].includes(name)) technicians[dept].push(name);
+                };
+                (techData || []).forEach(t => addToTechnicians(t.name, t.department));
+                (profileTechData || []).forEach(t => addToTechnicians(t.full_name, t.department));
+
+                // If technicians table is empty, sync from user_profiles automatically
+                if ((techData || []).length === 0 && (profileTechData || []).length > 0) {
+                    console.log('🔄 Syncing technicians from user_profiles to technicians table...');
+                    const syncRows = profileTechData.map(t => ({
+                        name: t.full_name,
                         department: t.department,
-                        status: t.status || 'available'
+                        location_id: currentLocationId,
+                        status: 'available'
                     }));
-                    console.log(`✅ Loaded ${technicians.length} technicians`);
+                    const { error: syncErr } = await supabaseClient
+                        .from('technicians')
+                        .upsert(syncRows, { onConflict: 'name,location_id' });
+                    if (syncErr) console.warn('Sync warning:', syncErr.message);
+                    else console.log('✅ Synced', syncRows.length, 'technicians to technicians table');
                 }
+
+                // If profileTechData was empty (RLS blocking it), fall back to direct SQL
+                if ((profileTechData || []).length === 0 && (techData || []).length === 0) {
+                    console.warn('⚠️ Both tech sources empty — RLS may be blocking user_profiles read.');
+                    console.warn('Fix: Run this in Supabase SQL editor:');
+                    console.warn('INSERT INTO technicians (name, department, location_id, status)');
+                    console.warn('SELECT full_name, department, location_id, \'available\'');
+                    console.warn('FROM user_profiles WHERE role = \'technician\'');
+                    console.warn('ON CONFLICT DO NOTHING;');
+                }
+
+                console.log('✅ Technicians loaded:', Object.entries(technicians).map(([k,v]) => k + ': [' + v.join(', ') + ']').join(' | ') || '(none)');
                 
                 if (thresholdData) {
                     stepThresholds = {};
@@ -3642,12 +3652,19 @@
         function filterByStep(step) {
             selectedStepFilter = step;
             selectedStatFilter = 'all';
+            selectedTechFilter = 'all';
+            render();
+        }
+
+        function filterByTech(tech) {
+            selectedTechFilter = selectedTechFilter === tech ? 'all' : tech;
             render();
         }
 
         function filterByStat(stat) {
             selectedStatFilter = stat;
             selectedStepFilter = 'all';
+            selectedTechFilter = 'all';
             render();
         }
 
@@ -3782,20 +3799,49 @@
             render();
         }
 
-        function addTechnicianToStep(step) {
+        async function removeTechnicianFromStep(step, techName) {
+            if (!technicians[step]) return;
+            technicians[step] = technicians[step].filter(t => t !== techName);
+
+            if (supabaseClient && currentLocationId) {
+                await supabaseClient.from('technicians')
+                    .delete()
+                    .eq('location_id', currentLocationId)
+                    .eq('department', step)
+                    .eq('name', techName);
+            }
+            render();
+        }
+
+        async function addTechnicianToStep(step) {
             const techName = prompt(`Enter technician name for ${step}:`);
-            if (!techName) return;
+            if (!techName || !techName.trim()) return;
+            const name = techName.trim();
 
             if (!technicians[step]) technicians[step] = [];
-            
-            if (technicians[step].includes(techName)) {
+            if (technicians[step].includes(name)) {
                 alert('Technician already assigned to this step');
                 return;
             }
 
-            technicians[step].push(techName);
+            technicians[step].push(name);
+
+            // Save to Supabase
+            if (supabaseClient && currentLocationId) {
+                const { error } = await supabaseClient.from('technicians').insert({
+                    name: name,
+                    department: step,
+                    location_id: currentLocationId,
+                    status: 'available'
+                });
+                if (error) {
+                    console.error('Failed to save tech to Supabase:', error.message);
+                    alert('Saved locally but failed to save to server: ' + error.message);
+                }
+            }
+
             render();
-            alert(`✓ ${techName} added to ${step}`);
+            alert(`✓ ${name} added to ${step}`);
         }
 
         function switchAdminTab(tab) {
@@ -4140,7 +4186,12 @@
 
                         <div style="margin-bottom:20px;">
                             <label style="display:block;font-weight:600;margin-bottom:5px;font-size:13px;">Department <span style="font-weight:400;color:#718096;">(technicians only)</span></label>
-                            <input type="text" id="editDepartment" value="${department}" placeholder="Detail, Mechanical, Xpel…" style="width:100%;padding:9px;border:2px solid #cbd5e0;border-radius:6px;font-size:14px;">
+                            <select id="editDepartment" style="width:100%;padding:9px;border:2px solid #cbd5e0;border-radius:6px;font-size:14px;">
+                                <option value="" ${!department ? 'selected' : ''}>— None —</option>
+                                ${STEPS.filter(s => s !== 'Finished').map(s =>
+                                    '<option value="' + s + '" ' + (s === department ? 'selected' : '') + '>' + s + '</option>'
+                                ).join('')}
+                            </select>
                         </div>
 
                         <div style="display:flex;gap:10px;">
@@ -4215,15 +4266,27 @@
                 return;
             }
 
-            if (!confirm('⚠️ Delete user "' + username + '"?\n\nThis removes their profile — they will no longer be able to log in.')) return;
+            if (!confirm('⚠️ Delete user "' + username + '"?\n\nThis permanently removes them from the app AND Supabase Auth so their email can be reused.')) return;
 
             try {
-                // Use SECURITY DEFINER function to bypass RLS
-                const { error } = await supabaseClient
+                // Step 1: delete from user_profiles (via RPC to bypass RLS)
+                const { error: profileErr } = await supabaseClient
                     .rpc('delete_user_profile', { target_user_id: userId });
+                if (profileErr) throw new Error('Profile delete failed: ' + profileErr.message);
 
-                if (error) throw new Error(error.message);
-                alert('✅ User "' + username + '" deleted.');
+                // Step 2: delete from auth.users via admin RPC
+                // Requires a SECURITY DEFINER function in Supabase — see note below
+                const { error: authErr } = await supabaseClient
+                    .rpc('delete_auth_user', { target_user_id: userId });
+
+                if (authErr) {
+                    // If the RPC doesn't exist yet, warn but don't block — profile is gone at least
+                    console.warn('Auth delete warning:', authErr.message);
+                    alert('✅ User "' + username + '" removed from app.\n\n⚠️ Could not delete from Supabase Auth: ' + authErr.message + '\n\nRun this SQL in Supabase to enable full deletion:\n\nCREATE OR REPLACE FUNCTION delete_auth_user(target_user_id uuid)\nRETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $\nBEGIN\n  DELETE FROM auth.users WHERE id = target_user_id;\nEND;\n$;');
+                } else {
+                    alert('✅ User "' + username + '" fully deleted — profile and auth account removed. Email can be reused.');
+                }
+
                 await loadUserManagementList();
             } catch (err) {
                 alert('❌ Error deleting user: ' + err.message);
@@ -4385,8 +4448,25 @@
                 const deptField = document.getElementById('newUserDepartment');
                 if (deptField) deptField.value = '';
 
-                // Reload users list
+                // Reload users list and refresh technicians in memory
                 await loadUserManagementList();
+                if (role === 'technician' && supabaseClient && currentLocationId) {
+                    const { data: freshTechs } = await supabaseClient
+                        .from('user_profiles')
+                        .select('full_name, department')
+                        .eq('location_id', currentLocationId)
+                        .eq('role', 'technician');
+                    if (freshTechs) {
+                        freshTechs.forEach(t => {
+                            if (!t.full_name || !t.department) return;
+                            if (!technicians[t.department]) technicians[t.department] = [];
+                            if (!technicians[t.department].includes(t.full_name))
+                                technicians[t.department].push(t.full_name);
+                        });
+                        console.log('🔄 Technicians refreshed live:', JSON.stringify(technicians));
+                        render(); // re-render so tech bubbles update immediately
+                    }
+                }
 
                 btn.textContent = originalText;
                 btn.disabled = false;
@@ -5256,44 +5336,95 @@
                 return;
             }
 
-            let reassignCount = 0;
+            // ── Show animated progress overlay ──
+            document.body.insertAdjacentHTML('beforeend', `
+                <div id="autoReassignOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:4000;display:flex;align-items:center;justify-content:center;">
+                    <div style="background:white;border-radius:16px;padding:32px 36px;width:100%;max-width:400px;text-align:center;box-shadow:0 24px 64px rgba(0,0,0,0.3);">
+                        <div style="font-size:40px;margin-bottom:10px;animation:arSpin 1s linear infinite;display:inline-block;">⚙️</div>
+                        <div style="font-size:17px;font-weight:700;color:#2d3748;margin-bottom:4px;">Auto-Reassigning</div>
+                        <div id="arMsg" style="font-size:13px;color:#718096;margin-bottom:18px;min-height:20px;">Analyzing vehicles…</div>
+                        <div style="background:#edf2f7;border-radius:999px;height:8px;overflow:hidden;margin-bottom:20px;">
+                            <div id="arBar" style="height:100%;width:0%;background:linear-gradient(90deg,#667eea,#764ba2);border-radius:999px;transition:width 0.25s ease;"></div>
+                        </div>
+                        <div style="display:flex;justify-content:center;gap:12px;">
+                            <div style="text-align:center;">
+                                <div id="arSteps" style="font-size:26px;font-weight:800;color:#553c9a;">0</div>
+                                <div style="font-size:10px;font-weight:700;color:#805ad5;letter-spacing:.5px;">STEP CHANGES</div>
+                            </div>
+                            <div style="width:1px;background:#e2e8f0;"></div>
+                            <div style="text-align:center;">
+                                <div id="arTechs" style="font-size:26px;font-weight:800;color:#2b6cb0;">0</div>
+                                <div style="font-size:10px;font-weight:700;color:#4299e1;letter-spacing:.5px;">TECH CHANGES</div>
+                            </div>
+                            <div style="width:1px;background:#e2e8f0;"></div>
+                            <div style="text-align:center;">
+                                <div id="arSaved" style="font-size:26px;font-weight:800;color:#276749;">0</div>
+                                <div style="font-size:10px;font-weight:700;color:#38a169;letter-spacing:.5px;">SAVED</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <style>
+                    @keyframes arSpin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+                </style>
+            `);
+
+            const setMsg  = t => { const e = document.getElementById('arMsg');   if(e) e.textContent = t; };
+            const setBar  = p => { const e = document.getElementById('arBar');   if(e) e.style.width = p + '%'; };
+            const setNum  = (id,n) => { const e = document.getElementById(id);   if(e) e.textContent = n; };
+
+            await new Promise(r => setTimeout(r, 80)); // let overlay paint
+
             let stepChangeCount = 0;
             let techChangeCount = 0;
+            const eligible = vehicles.filter(v => !reassignableLocks.has(v.vin) && v.currentStep !== 'Finished');
 
-            vehicles.forEach(vehicle => {
-                // Skip locked vehicles and finished ones
-                if (reassignableLocks.has(vehicle.vin) || vehicle.currentStep === 'Finished') {
-                    return;
-                }
+            setMsg('Scanning ' + eligible.length + ' vehicles…');
+            setBar(15);
+            await new Promise(r => setTimeout(r, 120));
 
-                // Check for better step
+            eligible.forEach((vehicle, i) => {
                 const suggestedStep = getSuggestedAlternateStep(vehicle);
                 if (suggestedStep) {
                     vehicle.currentStep = suggestedStep;
                     vehicle.stepStartTime = new Date();
                     vehicle.assignedTech = assignTechnician(suggestedStep);
                     stepChangeCount++;
-                    reassignCount++;
                 }
-
-                // Check for better tech in current step
                 const availableTech = getAvailableTechnician(vehicle.currentStep);
                 if (availableTech && availableTech !== vehicle.assignedTech) {
                     vehicle.assignedTech = availableTech;
                     vehicle.stepStartTime = new Date();
                     techChangeCount++;
-                    reassignCount++;
                 }
+                setBar(15 + 50 * (i + 1) / eligible.length);
+                setNum('arSteps', stepChangeCount);
+                setNum('arTechs', techChangeCount);
             });
 
-            // Persist all changed vehicles to Supabase
-            await Promise.all(vehicles
-                .filter(v => !reassignableLocks.has(v.vin) && v.currentStep !== 'Finished')
-                .map(v => persistVehicleState(v))
-            );
+            setMsg('Saving to server…');
+            setBar(70);
+            await new Promise(r => setTimeout(r, 80));
+
+            let saved = 0;
+            await Promise.all(eligible.map(async v => {
+                await persistVehicleState(v);
+                saved++;
+                setNum('arSaved', saved);
+                setBar(70 + 28 * saved / eligible.length);
+            }));
+
+            setBar(100);
+            setMsg('✓ Done!');
+            await new Promise(r => setTimeout(r, 600));
+
+            const overlay = document.getElementById('autoReassignOverlay');
+            if (overlay) overlay.remove();
 
             render();
-            alert(`✓ Auto-reassignment complete!\n\n${reassignCount} total changes:\n• ${stepChangeCount} step changes\n• ${techChangeCount} technician changes`);
+            if (stepChangeCount + techChangeCount > 0) {
+                alert('✓ Auto-reassignment complete!\n\n' + (stepChangeCount + techChangeCount) + ' total changes:\n• ' + stepChangeCount + ' step changes\n• ' + techChangeCount + ' technician changes');
+            }
         }
 
         function toggleReassignLock(vin) {
@@ -5466,6 +5597,27 @@ ${baseDirectory}/
             return { inStep, movable, overdue };
         }
 
+        async function pushToFinished(vin) {
+            const vehicle = vehicles.find(v => v.vin === vin);
+            if (!vehicle) return;
+            if (!confirm('Push ' + (vehicle.stockNumber || vin) + ' directly to Finished?\n\nThis will skip any incomplete steps. Administrator action.')) return;
+
+            vehicle.currentStep = 'Finished';
+            vehicle.stepStartTime = new Date();
+            vehicle.assignedTech = null;
+
+            if (!vehicle.noteHistory) vehicle.noteHistory = [];
+            vehicle.noteHistory.push({
+                text: 'Manually pushed to Finished by ' + (currentUser ? currentUser.name : 'Admin') + ' (steps bypassed)',
+                timestamp: new Date(),
+                user: currentUser ? currentUser.username : 'admin',
+                id: Date.now() + Math.random()
+            });
+
+            await persistVehicleState(vehicle);
+            render();
+        }
+
         function quickCompleteStep(vin) {
             const vehicle = vehicles.find(v => v.vin === vin);
             if (vehicle && vehicle.currentStep !== 'Finished') {
@@ -5514,6 +5666,39 @@ ${baseDirectory}/
             }
         }
 
+        function buildTechOptions(vehicle) {
+            // Log for debugging
+            console.log('🔧 buildTechOptions | currentStep:', vehicle.currentStep, '| technicians:', JSON.stringify(technicians));
+
+            // Gather techs for this specific step
+            const stepTechs = (technicians[vehicle.currentStep] || []).slice();
+
+            // Gather ALL techs across every step as fallback
+            const allTechs = [];
+            Object.entries(technicians).forEach(([step, list]) => {
+                (list || []).forEach(t => { if (!allTechs.includes(t)) allTechs.push(t); });
+            });
+
+            // Decide which list to show — prefer step-specific, fall back to all
+            const listToShow = stepTechs.length > 0 ? stepTechs : allTechs;
+            const label = stepTechs.length > 0
+                ? '— Unassigned —'
+                : allTechs.length > 0 ? '— Unassigned (all techs shown) —' : '— No techs configured —';
+
+            let html = '<option value="">' + label + '</option>';
+
+            // If current assignedTech isn't in list, add them at top so they still show
+            if (vehicle.assignedTech && !listToShow.includes(vehicle.assignedTech)) {
+                html += '<option value="' + vehicle.assignedTech + '" selected>' + vehicle.assignedTech + ' (current)</option>';
+            }
+
+            listToShow.forEach(t => {
+                html += '<option value="' + t + '" ' + (t === vehicle.assignedTech ? 'selected' : '') + '>' + t + '</option>';
+            });
+
+            return html;
+        }
+
         function showAdminVehicleDialog(vehicle) {
             const dialogHTML = `
                 <div id="vehicleDialog" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px;">
@@ -5552,7 +5737,14 @@ ${baseDirectory}/
                             </div>
                             <div><strong>Time in Step:</strong> ${formatTimeDiff(vehicle.stepStartTime)}</div>
                             <div><strong>Total Time:</strong> ${formatTimeDiff(vehicle.entryTime)}</div>
-                            <div><strong>Assigned Tech:</strong> ${vehicle.assignedTech}</div>
+                            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                                <strong>Assigned Tech:</strong>
+                                <select id="techSelect_${vehicle.vin}"
+                                    style="flex:1;min-width:130px;padding:4px 8px;border:2px solid #48bb78;border-radius:5px;font-size:12px;font-weight:600;color:#2d3748;cursor:pointer;"
+                                    onchange="changeTechFromDialog('${vehicle.vin}', this.value)">
+                                    ${buildTechOptions(vehicle)}
+                                </select>
+                            </div>
                             <div><strong>Photos:</strong> ${vehicle.photos?.length || 0}</div>
                             <div><strong>Notes:</strong> ${(vehicle.noteHistory || []).length}</div>
                         </div>
@@ -5869,6 +6061,26 @@ ${baseDirectory}/
             if (selectedBtn) selectedBtn.classList.add('active');
         }
         
+        async function changeTechFromDialog(vin, newTech) {
+            const vehicle = vehicles.find(v => v.vin === vin);
+            if (!vehicle) return;
+            vehicle.assignedTech = newTech || null;
+            vehicle.stepStartTime = new Date(); // reset timer on reassign
+
+            if (!vehicle.noteHistory) vehicle.noteHistory = [];
+            vehicle.noteHistory.push({
+                text: 'Tech changed to ' + (newTech || 'Unassigned'),
+                timestamp: new Date(),
+                user: currentUser ? currentUser.username : 'Unknown',
+                id: Date.now() + Math.random()
+            });
+
+            await persistVehicleState(vehicle);
+            // Refresh the select to reflect saved state without closing dialog
+            const sel = document.getElementById('techSelect_' + vin);
+            if (sel) sel.style.borderColor = '#48bb78';
+        }
+
         async function quickMoveFromHeader(vin, selectEl) {
             const newStep = selectEl.value;
             const vehicle = vehicles.find(v => v.vin === vin);
@@ -7095,16 +7307,23 @@ Assign a workflow when the vehicle arrives.`);
         // Initialize - check for existing session
         async function init() {
             if (USE_SUPABASE && supabaseClient) {
+                // Show a brief loading state so the user sees something on refresh
+                document.getElementById('app').innerHTML = `
+                    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#f7fafc;">
+                        <div style="font-size:40px;margin-bottom:16px;animation:arSpin 1s linear infinite;display:inline-block;">🔄</div>
+                        <div style="font-size:16px;font-weight:600;color:#4a5568;">Restoring session…</div>
+                    </div>
+                    <style>@keyframes arSpin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}</style>
+                `;
                 const { data: { session } } = await supabaseClient.auth.getSession();
                 if (session) {
-                    console.log('📌 Existing session found');
+                    console.log('📌 Existing session found — restoring');
                     await loadUserProfileFromSupabase(session.user.id);
+                    return; // loadUserProfileFromSupabase calls render() at the end
                 }
             }
-            render();
+            render(); // no session — show login
         }
-        
-        init();
     </script>
     <!-- Add Location Modal -->
     <div id="addLocationModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
