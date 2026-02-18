@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Vehicle Recon Management System</title>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/index.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -7515,18 +7515,187 @@ Assign a workflow when the vehicle arrives.`);
         let torchOn          = false;
         let torchTrack       = null;   // the video track that supports torch
 
+        // Detect iOS (Safari on iPhone/iPad)
+        const isIOS = /iP(hone|od|ad)/.test(navigator.userAgent) ||
+                      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
         function openVinScanner() {
             if (!currentUser) return;
             const existing = document.getElementById('vinScannerModal');
             if (existing) existing.remove();
             torchOn = false;
 
+            injectScannerStyles();
+
+            // iOS: use native camera capture (file input with capture attribute)
+            // This gives full autofocus, HDR, and works perfectly on every iPhone
+            if (isIOS) {
+                openIOSScanner();
+                return;
+            }
+
+            // Android / Desktop: live video stream scanner
+            openLiveScanner();
+        }
+
+        // ── iOS path: native camera → decode still image ─────────────────
+        function openIOSScanner() {
+            // Create hidden file input with camera capture
+            const inp = document.createElement('input');
+            inp.type = 'file';
+            inp.accept = 'image/*';
+            inp.setAttribute('capture', 'environment'); // rear camera
+            inp.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;';
+            document.body.appendChild(inp);
+
+            inp.onchange = async (e) => {
+                const file = e.target.files[0];
+                inp.remove();
+                if (!file) return;
+
+                // Show a brief "processing" modal
+                const proc = document.createElement('div');
+                proc.id = 'vinScannerModal';
+                proc.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:5000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;';
+                proc.innerHTML = `
+                    <div style="font-size:48px;">📷</div>
+                    <div style="color:white;font-size:17px;font-weight:700;">Decoding barcode…</div>
+                    <div style="color:#a0aec0;font-size:13px;">Processing image</div>
+                `;
+                document.body.appendChild(proc);
+
+                try {
+                    const result = await decodeImageFile(file);
+                    proc.remove();
+                    if (result) {
+                        playScanBeep(true);
+                        if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
+                        showVinLookupResult(result.replace(/[^A-Za-z0-9]/g,'').toUpperCase(), result, lookupInCache(result.replace(/[^A-Za-z0-9]/g,'').toUpperCase()));
+                    } else {
+                        playScanBeep(false);
+                        if (navigator.vibrate) navigator.vibrate([150]);
+                        // Show manual entry fallback
+                        showIOSManualFallback('Could not read barcode — try better lighting or enter manually');
+                    }
+                } catch(err) {
+                    proc.remove();
+                    showIOSManualFallback('Error processing image');
+                }
+            };
+
+            inp.oncancel = () => inp.remove();
+            inp.click();
+        }
+
+        function showIOSManualFallback(msg) {
             const modal = document.createElement('div');
             modal.id = 'vinScannerModal';
+            modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:5000;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;padding:0;';
+            modal.innerHTML = `
+                <div style="width:100%;max-width:480px;background:#1a202c;border-radius:20px 20px 0 0;padding:28px 24px 44px;animation:slideUp 0.3s ease;">
+                    <div style="text-align:center;margin-bottom:20px;">
+                        <div style="font-size:40px;margin-bottom:10px;">⚠️</div>
+                        <div style="color:white;font-size:16px;font-weight:700;margin-bottom:6px;">Barcode Not Detected</div>
+                        <div style="color:#718096;font-size:13px;">${msg}</div>
+                    </div>
+                    <div style="margin-bottom:14px;">
+                        <button onclick="closeVinScanner();openVinScanner();"
+                            style="width:100%;padding:13px;background:#4299e1;color:white;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:10px;">
+                            📷 Try Again
+                        </button>
+                    </div>
+                    <div style="color:#718096;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:7px;">Or enter manually</div>
+                    <div style="display:flex;gap:8px;">
+                        <input id="vinManualInput" type="text" placeholder="VIN or Stock #"
+                            style="flex:1;padding:10px 12px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.2);border-radius:8px;color:white;font-size:14px;outline:none;"
+                            onkeydown="if(event.key==='Enter') lookupVinManual()">
+                        <button onclick="lookupVinManual()"
+                            style="background:#48bb78;color:white;border:none;border-radius:8px;padding:10px 16px;font-size:14px;font-weight:700;cursor:pointer;">
+                            Go
+                        </button>
+                    </div>
+                    <button onclick="closeVinScanner()" style="width:100%;margin-top:14px;padding:11px;background:rgba(255,255,255,0.08);color:#a0aec0;border:none;border-radius:10px;font-size:14px;cursor:pointer;">
+                        Cancel
+                    </button>
+                </div>
+            `;
+            document.body.appendChild(modal);
+        }
+
+        // Decode a File/Blob image using canvas + jsQR + Code128
+        async function decodeImageFile(file) {
+            return new Promise((resolve) => {
+                const img = new Image();
+                const url = URL.createObjectURL(file);
+                img.onload = () => {
+                    URL.revokeObjectURL(url);
+                    // Try multiple canvas sizes for better decode accuracy
+                    const sizes = [
+                        { w: img.naturalWidth,   h: img.naturalHeight },
+                        { w: Math.min(1280, img.naturalWidth), h: Math.round(img.naturalHeight * Math.min(1280, img.naturalWidth) / img.naturalWidth) },
+                        { w: 640, h: Math.round(img.naturalHeight * 640 / img.naturalWidth) }
+                    ];
+                    const cnv = document.createElement('canvas');
+                    const ctx = cnv.getContext('2d', { willReadFrequently: true });
+
+                    for (const { w, h } of sizes) {
+                        cnv.width = w; cnv.height = h;
+                        ctx.drawImage(img, 0, 0, w, h);
+                        const imgData = ctx.getImageData(0, 0, w, h);
+
+                        // Try jsQR
+                        if (typeof jsQR === 'function') {
+                            const qr = jsQR(imgData.data, w, h, { inversionAttempts: 'attemptBoth' });
+                            if (qr && qr.data && qr.data.trim().length >= 4) { resolve(qr.data.trim()); return; }
+                        }
+
+                        // Try Code128 at normal orientation
+                        let r = Code128Decoder.decode(imgData);
+                        if (r) { resolve(r); return; }
+
+                        // Try rotated 90° (sideways barcode on door jamb)
+                        const rot = rotateImageData90(imgData, w, h);
+                        r = Code128Decoder.decode(rot);
+                        if (r) { resolve(r); return; }
+
+                        // Try rotated 270°
+                        const rot270 = rotateImageData90(rot, h, w);
+                        const rot2   = rotateImageData90(rot270, w, h);
+                        r = Code128Decoder.decode(rot2);
+                        if (r) { resolve(r); return; }
+                    }
+                    resolve(null);
+                };
+                img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+                img.src = url;
+            });
+        }
+
+        // Rotate ImageData 90° clockwise
+        function rotateImageData90(imgData, w, h) {
+            const src = imgData.data;
+            const dst = new Uint8ClampedArray(w * h * 4);
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    const srcIdx = (y * w + x) * 4;
+                    const dstIdx = ((x * h) + (h - 1 - y)) * 4;
+                    dst[dstIdx]     = src[srcIdx];
+                    dst[dstIdx + 1] = src[srcIdx + 1];
+                    dst[dstIdx + 2] = src[srcIdx + 2];
+                    dst[dstIdx + 3] = src[srcIdx + 3];
+                }
+            }
+            return { data: dst, width: h, height: w };
+        }
+
+        // ── Android/Desktop path: live video scanner ──────────────────────
+        function openLiveScanner() {
+            const modal = document.createElement('div');
+            modal.id = 'vinScannerModal';
+            // orientation:lock CSS keeps the modal portrait even if phone rotates
             modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:5000;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:0;overflow:hidden;';
             modal.innerHTML = `
                 <div style="width:100%;max-width:480px;display:flex;flex-direction:column;height:100%;position:relative;">
-
                     <!-- Header -->
                     <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;background:rgba(0,0,0,0.75);backdrop-filter:blur(8px);z-index:10;flex-shrink:0;">
                         <div>
@@ -7534,12 +7703,10 @@ Assign a workflow when the vehicle arrives.`);
                             <div style="color:#a0aec0;font-size:11px;margin-top:1px;">Point at VIN barcode or QR code</div>
                         </div>
                         <div style="display:flex;align-items:center;gap:8px;">
-                            <!-- Torch button -->
                             <button id="torchBtn" onclick="toggleTorch()" title="Toggle flashlight"
                                 style="background:rgba(255,255,255,0.1);border:2px solid rgba(255,255,255,0.15);color:white;width:40px;height:40px;border-radius:50%;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s;">
                                 🔦
                             </button>
-                            <!-- Close button -->
                             <button onclick="closeVinScanner()"
                                 style="background:rgba(255,255,255,0.1);border:none;color:white;width:40px;height:40px;border-radius:50%;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;">
                                 ✕
@@ -7600,8 +7767,8 @@ Assign a workflow when the vehicle arrives.`);
             `;
 
             document.body.appendChild(modal);
+            lockOrientation();
             startScannerCamera();
-            injectScannerStyles();
         }
 
         function injectScannerStyles() {
@@ -7622,12 +7789,160 @@ Assign a workflow when the vehicle arrives.`);
                     border-color: rgba(255,220,50,0.7) !important;
                     box-shadow: 0 0 12px rgba(255,220,50,0.4);
                 }
+                /* Orientation lock: keep scanner modal portrait regardless of device rotation */
+                #vinScannerModal {
+                    transform-origin: top left;
+                }
+                @media screen and (orientation: landscape) {
+                    #vinScannerModal {
+                        width: 100vh !important;
+                        height: 100vw !important;
+                        transform: rotate(-90deg) translateX(-100%);
+                    }
+                }
             `;
             document.head.appendChild(st);
         }
 
-        // ZXing reader instance
-        let _zxingReader = null;
+        // Lock orientation via Screen Orientation API (Android Chrome supports this)
+        function lockOrientation() {
+            try {
+                if (screen.orientation && screen.orientation.lock) {
+                    screen.orientation.lock('portrait').catch(() => {});
+                }
+            } catch(e) {}
+        }
+
+        function unlockOrientation() {
+            try {
+                if (screen.orientation && screen.orientation.unlock) {
+                    screen.orientation.unlock();
+                }
+            } catch(e) {}
+        }
+
+        // ── Inline Code-128 barcode decoder (no CDN needed) ──────────────
+        // Decodes Code128 A/B/C from a row of pixel data.
+        // Returns decoded string or null.
+        const Code128Decoder = (() => {
+            // Code128 bar-widths table: each symbol = 6 elements (3 bars, 3 spaces) in units
+            const SYMBOLS = [
+                [2,1,2,2,2,2],[2,2,2,1,2,2],[2,2,2,2,2,1],[1,2,1,2,2,3],
+                [1,2,1,3,2,2],[1,3,1,2,2,2],[1,2,2,2,1,3],[1,2,2,3,1,2],
+                [1,3,2,2,1,2],[2,2,1,2,1,3],[2,2,1,3,1,2],[2,3,1,2,1,2],
+                [1,1,2,2,3,2],[1,2,2,1,3,2],[1,2,2,2,3,1],[1,1,3,2,2,2],
+                [1,2,3,1,2,2],[1,2,3,2,2,1],[2,2,3,2,1,1],[2,2,1,1,3,2],
+                [2,2,1,2,3,1],[2,1,3,2,1,2],[2,2,3,1,1,2],[3,1,2,1,3,1],
+                [3,1,1,2,2,2],[3,2,1,1,2,2],[3,2,1,2,2,1],[3,1,2,2,1,2],
+                [3,2,2,1,1,2],[3,2,2,2,1,1],[2,1,2,1,2,3],[2,1,2,3,2,1],
+                [2,3,2,1,2,1],[1,1,1,3,2,3],[1,3,1,1,2,3],[1,3,1,3,2,1],
+                [1,1,2,3,1,3],[1,3,2,1,1,3],[1,3,2,3,1,1],[2,1,1,3,1,3],
+                [2,3,1,1,1,3],[2,3,1,3,1,1],[1,1,2,1,3,3],[1,1,2,3,3,1],
+                [1,3,2,1,3,1],[1,1,3,1,2,3],[1,1,3,3,2,1],[1,3,3,1,2,1],
+                [3,1,3,1,2,1],[2,1,1,3,3,1],[2,3,1,1,3,1],[2,1,3,1,1,3],
+                [2,1,3,3,1,1],[2,1,3,1,3,1],[3,1,1,1,2,3],[3,1,1,3,2,1],
+                [3,3,1,1,2,1],[3,1,2,1,1,3],[3,1,2,3,1,1],[3,3,2,1,1,1],
+                [3,1,4,1,1,1],[2,2,1,4,1,1],[4,3,1,1,1,1],[1,1,1,2,2,4],
+                [1,1,1,4,2,2],[1,2,1,1,2,4],[1,2,1,4,2,1],[1,4,1,1,2,2],
+                [1,4,1,2,2,1],[1,1,2,2,1,4],[1,1,2,4,1,2],[1,2,2,1,1,4],
+                [1,2,2,4,1,1],[1,4,2,1,1,2],[1,4,2,2,1,1],[2,4,1,2,1,1],
+                [2,2,1,1,1,4],[4,1,3,1,1,1],[2,4,1,1,1,2],[1,3,4,1,1,1],
+                [1,1,1,2,4,2],[1,2,1,1,4,2],[1,2,1,2,4,1],[1,1,4,2,1,2],
+                [1,2,4,1,1,2],[1,2,4,2,1,1],[4,1,1,2,1,2],[4,2,1,1,1,2],
+                [4,2,1,2,1,1],[2,1,2,1,4,1],[2,1,4,1,2,1],[4,1,2,1,2,1],
+                [1,1,1,1,4,3],[1,1,1,3,4,1],[1,3,1,1,4,1],[1,1,4,1,1,3],
+                [1,1,4,3,1,1],[4,1,1,1,1,3],[4,1,1,3,1,1],[1,1,3,1,4,1],
+                [1,1,4,1,3,1],[3,1,1,1,4,1],[4,1,1,1,3,1],[2,1,1,4,1,2],
+                [2,1,1,2,1,4],[2,1,1,2,3,2]
+            ];
+            const START_A = 103, START_B = 104, START_C = 105, STOP = 106;
+            function matchSymbol(runs) {
+                const total = runs.reduce((a, b) => a + b, 0);
+                for (let s = 0; s < SYMBOLS.length; s++) {
+                    const symTotal = SYMBOLS[s].reduce((a, b) => a + b, 0);
+                    let ok = true;
+                    for (let i = 0; i < 6; i++) {
+                        const expected = SYMBOLS[s][i] / symTotal * total;
+                        if (Math.abs(runs[i] - expected) > expected * 0.35 + 1) { ok = false; break; }
+                    }
+                    if (ok) return s;
+                }
+                return -1;
+            }
+            function decodeLine(pixels, threshold) {
+                // Convert to black/white run-lengths
+                let runs = [], cur = pixels[0] < threshold, count = 0;
+                for (let i = 0; i < pixels.length; i++) {
+                    const dark = pixels[i] < threshold;
+                    if (dark === cur) { count++; }
+                    else { runs.push(count); count = 1; cur = dark; }
+                }
+                runs.push(count);
+                // Must start on a dark bar
+                let idx = cur ? 1 : 0; // if last was light, start is dark at 0; else skip 1
+                idx = 0;
+                if (pixels[0] >= threshold) idx = 1; // skip leading quiet zone bar
+                
+                // Collect 6-element windows
+                let syms = [];
+                for (; idx + 5 < runs.length; idx += 6) {
+                    const s = matchSymbol(runs.slice(idx, idx + 6));
+                    if (s === -1) return null;
+                    syms.push(s);
+                    if (s === STOP) break;
+                }
+                if (syms.length < 3) return null;
+                const startSym = syms[0];
+                if (startSym !== START_A && startSym !== START_B && startSym !== START_C) return null;
+                const stopSym = syms[syms.length - 1];
+                if (stopSym !== STOP) return null;
+                
+                let mode = startSym === START_A ? 'A' : startSym === START_B ? 'B' : 'C';
+                let result = '';
+                const data = syms.slice(1, syms.length - 1); // strip start/stop
+                for (let i = 0; i < data.length - 1; i++) { // -1 strips checksum
+                    const v = data[i];
+                    if (mode === 'C') {
+                        result += String(v).padStart(2, '0');
+                    } else if (mode === 'B') {
+                        if (v >= 0 && v <= 94) result += String.fromCharCode(v + 32);
+                        else if (v === 100) mode = 'A';
+                        else if (v === 99)  mode = 'C';
+                    } else {
+                        if (v >= 0 && v <= 63)  result += String.fromCharCode(v + 32);
+                        else if (v >= 64 && v <= 95) result += String.fromCharCode(v - 64);
+                        else if (v === 101) mode = 'B';
+                        else if (v === 99)  mode = 'C';
+                    }
+                }
+                return result.length >= 4 ? result : null;
+            }
+            function decode(imageData) {
+                const { data, width, height } = imageData;
+                // Sample multiple horizontal scan lines
+                const rows = [0.25, 0.35, 0.45, 0.5, 0.55, 0.65, 0.75].map(f => Math.floor(f * height));
+                for (const row of rows) {
+                    const pixels = [];
+                    for (let x = 0; x < width; x++) {
+                        const i = (row * width + x) * 4;
+                        pixels.push(0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2]);
+                    }
+                    // Adaptive threshold
+                    const avg = pixels.reduce((a, b) => a + b, 0) / pixels.length;
+                    const result = decodeLine(pixels, avg * 0.85);
+                    if (result) return result;
+                    const result2 = decodeLine(pixels, 128);
+                    if (result2) return result2;
+                }
+                return null;
+            }
+            return { decode };
+        })();
+        // ── End inline Code-128 decoder ──────────────────────────────────
+
+        // Shared scan canvas (reused across frames)
+        let _scanCanvas = null;
+        let _scanCtx = null;
 
         async function startScannerCamera() {
             scannerActive = true;
@@ -7635,8 +7950,11 @@ Assign a workflow when the vehicle arrives.`);
             const video = document.getElementById('vinScannerVideo');
             const badge = document.getElementById('scannerStatusBadge');
 
+            // Pre-create canvas for frame capture
+            _scanCanvas = document.createElement('canvas');
+            _scanCtx    = _scanCanvas.getContext('2d', { willReadFrequently: true });
+
             try {
-                // Request camera stream
                 scannerStream = await navigator.mediaDevices.getUserMedia({
                     video: {
                         facingMode: { ideal: 'environment' },
@@ -7647,7 +7965,7 @@ Assign a workflow when the vehicle arrives.`);
                 video.srcObject = scannerStream;
                 await video.play();
 
-                // Grab the video track for torch control
+                // Torch support
                 const tracks = scannerStream.getVideoTracks();
                 if (tracks.length > 0) {
                     torchTrack = tracks[0];
@@ -7658,90 +7976,58 @@ Assign a workflow when the vehicle arrives.`);
 
                 if (badge) badge.textContent = '🔍 Scanning…';
 
-                // Try native BarcodeDetector first (fastest), fall back to ZXing
-                const nativeDetector = (() => {
-                    if (typeof BarcodeDetector !== 'undefined') {
-                        try {
-                            return new BarcodeDetector({
-                                formats: ['qr_code', 'code_128', 'code_39', 'ean_13', 'itf', 'aztec', 'data_matrix', 'code_93', 'upc_a', 'upc_e']
-                            });
-                        } catch(e) { return null; }
-                    }
-                    return null;
-                })();
-
-                if (nativeDetector) {
-                    console.log('✅ Using native BarcodeDetector');
-                    // Native path — rAF loop
-                    const nativeScanLoop = async () => {
-                        if (!scannerActive) return;
-                        if (video.readyState >= 2) {
-                            try {
-                                const barcodes = await nativeDetector.detect(video);
-                                if (barcodes && barcodes.length > 0) {
-                                    const code = barcodes[0].rawValue;
-                                    if (code && code.trim().length >= 4) {
-                                        handleScanResult(code.trim());
-                                        return;
+                // Use native BarcodeDetector if available, otherwise our canvas approach
+                if (typeof BarcodeDetector !== 'undefined') {
+                    let nativeDet;
+                    try {
+                        nativeDet = new BarcodeDetector({
+                            formats: ['qr_code','code_128','code_39','ean_13','itf','aztec','data_matrix','upc_a','upc_e','code_93']
+                        });
+                    } catch(e) { nativeDet = null; }
+                    if (nativeDet) {
+                        console.log('Using native BarcodeDetector');
+                        const loop = async () => {
+                            if (!scannerActive) return;
+                            if (video.readyState >= 2) {
+                                try {
+                                    const barcodes = await nativeDet.detect(video);
+                                    if (barcodes && barcodes.length > 0 && barcodes[0].rawValue.trim().length >= 4) {
+                                        handleScanResult(barcodes[0].rawValue.trim()); return;
                                     }
-                                }
-                            } catch(e) { /* frame not ready */ }
-                        }
-                        if (scannerActive) scannerAnimFrame = requestAnimationFrame(nativeScanLoop);
-                    };
-                    scannerAnimFrame = requestAnimationFrame(nativeScanLoop);
+                                } catch(e) {}
+                            }
+                            if (scannerActive) scannerAnimFrame = requestAnimationFrame(loop);
+                        };
+                        scannerAnimFrame = requestAnimationFrame(loop);
+                        return;
+                    }
+                }
 
-                } else if (typeof ZXingBrowser !== 'undefined') {
-                    // ZXing fallback — continuous decode from video element
-                    console.log('✅ Using ZXing fallback decoder');
-                    const hints = new Map();
-                    const formats = [
-                        ZXingBrowser.BarcodeFormat.QR_CODE,
-                        ZXingBrowser.BarcodeFormat.CODE_128,
-                        ZXingBrowser.BarcodeFormat.CODE_39,
-                        ZXingBrowser.BarcodeFormat.EAN_13,
-                        ZXingBrowser.BarcodeFormat.ITF,
-                        ZXingBrowser.BarcodeFormat.AZTEC,
-                        ZXingBrowser.BarcodeFormat.DATA_MATRIX,
-                        ZXingBrowser.BarcodeFormat.PDF_417
-                    ].filter(Boolean);
-                    if (formats.length) hints.set(ZXingBrowser.DecodeHintType.POSSIBLE_FORMATS, formats);
-                    hints.set(ZXingBrowser.DecodeHintType.TRY_HARDER, true);
+                // Canvas-based fallback: captures frame → tries jsQR (if loaded) + Code128
+                console.log('Using canvas decoder fallback');
+                const canvasLoop = () => {
+                    if (!scannerActive) return;
+                    if (video.readyState >= 2 && video.videoWidth > 0) {
+                        const W = video.videoWidth, H = video.videoHeight;
+                        _scanCanvas.width = W; _scanCanvas.height = H;
+                        _scanCtx.drawImage(video, 0, 0, W, H);
+                        const imgData = _scanCtx.getImageData(0, 0, W, H);
 
-                    _zxingReader = new ZXingBrowser.BrowserMultiFormatReader(hints);
-
-                    // Use a canvas to grab frames at 10fps and decode
-                    const canvas = document.createElement('canvas');
-                    const ctx2d  = canvas.getContext('2d');
-
-                    const zxingLoop = async () => {
-                        if (!scannerActive) return;
-                        if (video.readyState >= 2 && video.videoWidth > 0) {
-                            canvas.width  = video.videoWidth;
-                            canvas.height = video.videoHeight;
-                            ctx2d.drawImage(video, 0, 0);
-                            try {
-                                const result = _zxingReader.decodeFromCanvas(canvas);
-                                if (result && result.getText().trim().length >= 4) {
-                                    handleScanResult(result.getText().trim());
-                                    return;
-                                }
-                            } catch(e) {
-                                // NotFoundException is normal (no barcode in frame) — ignore silently
+                        // Try jsQR (QR codes) if available
+                        if (typeof jsQR === 'function') {
+                            const qr = jsQR(imgData.data, W, H, { inversionAttempts: 'attemptBoth' });
+                            if (qr && qr.data && qr.data.trim().length >= 4) {
+                                handleScanResult(qr.data.trim()); return;
                             }
                         }
-                        if (scannerActive) scannerAnimFrame = setTimeout(zxingLoop, 100); // ~10fps
-                    };
-                    zxingLoop();
 
-                } else {
-                    // No barcode library available at all
-                    if (badge) {
-                        badge.style.background = 'rgba(113,128,150,0.9)';
-                        badge.textContent = '⌨️ Use manual entry below';
+                        // Try Code128 (VIN barcodes are almost always Code128)
+                        const code128 = Code128Decoder.decode(imgData);
+                        if (code128) { handleScanResult(code128); return; }
                     }
-                    console.warn('No barcode decoder available (BarcodeDetector or ZXing)');
-                }
+                    if (scannerActive) scannerAnimFrame = setTimeout(canvasLoop, 120); // ~8fps
+                };
+                canvasLoop();
 
             } catch (err) {
                 console.warn('Camera error:', err);
@@ -7764,14 +8050,13 @@ Assign a workflow when the vehicle arrives.`);
                 }
             } catch(e) {
                 console.warn('Torch toggle failed:', e);
-                torchOn = !torchOn; // revert
+                torchOn = !torchOn;
             }
         }
 
-        // Legacy stub — no longer used directly but kept for safety
-        async function scanFrame() {
-            // No-op: scanning is now handled inside startScannerCamera()
-        }
+        // Legacy stubs — scanning is now inside startScannerCamera
+        function getBarcodeDetector() { return null; }
+        async function scanFrame() {}
 
         function handleScanResult(raw) {
             if (!scannerActive) return;
@@ -7974,19 +8259,15 @@ Assign a workflow when the vehicle arrives.`);
 
         function closeVinScanner() {
             scannerActive = false;
+            unlockOrientation();
             if (torchOn && torchTrack) {
                 try { torchTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch(e) {}
                 torchOn = false;
             }
             if (scannerStream) { scannerStream.getTracks().forEach(t => t.stop()); scannerStream = null; }
-            // Cancel both rAF and setTimeout-based scan loops
             cancelAnimationFrame(scannerAnimFrame);
             clearTimeout(scannerAnimFrame);
-            // Clean up ZXing reader if active
-            if (_zxingReader) {
-                try { _zxingReader.reset(); } catch(e) {}
-                _zxingReader = null;
-            }
+            _scanCanvas = null; _scanCtx = null;
             const modal = document.getElementById('vinScannerModal');
             if (modal) modal.remove();
         }
