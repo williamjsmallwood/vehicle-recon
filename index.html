@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Vehicle Recon Management System</title>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -7435,29 +7434,28 @@ Assign a workflow when the vehicle arrives.`);
 
         // ==================== VIN / QR SCANNER ====================
 
-        // ---- Scan-cache: populated once on load, refreshed on Supabase writes ----
-        let scanCache = [];   // lightweight snapshot: {vin, stockNumber, ...}
+        // ---- In-memory vehicle cache (built once on load, no Supabase per scan) ----
+        let scanCache      = [];
         let scanCacheReady = false;
 
         function buildScanCache() {
-            // Clone the live vehicles array into a fast-lookup cache
             scanCache = vehicles.map(v => ({
-                vin:         (v.vin || '').toUpperCase(),
-                stockNumber: (v.stockNumber || v.stock_number || '').toUpperCase(),
-                year:        v.year || '',
-                make:        v.make || '',
-                model:       v.model || '',
-                currentStep: v.currentStep || v.current_step || '',
+                vin:          (v.vin || '').toUpperCase(),
+                stockNumber:  (v.stockNumber || v.stock_number || '').toUpperCase(),
+                year:         v.year  || '',
+                make:         v.make  || '',
+                model:        v.model || '',
+                currentStep:  v.currentStep  || v.current_step  || '',
                 completedSteps: v.completedSteps || [],
-                skippedSteps:   v.skippedSteps  || [],
-                assignedTech:   v.assignedTech  || v.assigned_tech || '',
-                workflow:       v.workflow || '',
-                stepStartTime:  v.stepStartTime,
-                entryTime:      v.entryTime,
-                tags:           v.tags || []
+                skippedSteps:   v.skippedSteps   || [],
+                assignedTech:   v.assignedTech   || v.assigned_tech || '',
+                workflow:     v.workflow  || '',
+                stepStartTime: v.stepStartTime,
+                entryTime:    v.entryTime,
+                tags:         v.tags || []
             }));
             scanCacheReady = true;
-            console.log(`📦 Scan cache built: ${scanCache.length} vehicles`);
+            console.log('📦 Scan cache:', scanCache.length, 'vehicles');
         }
 
         function lookupInCache(query) {
@@ -7471,295 +7469,201 @@ Assign a workflow when the vehicle arrives.`);
             ) || null;
         }
 
-        // ---- Audio: Web Audio API beep (no CDN needed) ----
+        // ---- Web Audio beep (no CDN) ----
         let _audioCtx = null;
-        function getAudioCtx() {
-            if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            return _audioCtx;
-        }
-
-        function playScanBeep(success = true) {
+        function playScanBeep(success) {
             try {
-                const ctx = getAudioCtx();
-                // Resume context if suspended (autoplay policy)
+                if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const ctx = _audioCtx;
                 if (ctx.state === 'suspended') ctx.resume();
-
-                const osc  = ctx.createOscillator();
-                const gain = ctx.createGain();
-                osc.connect(gain);
-                gain.connect(ctx.destination);
-
+                const osc = ctx.createOscillator();
+                const g   = ctx.createGain();
+                osc.connect(g); g.connect(ctx.destination);
                 if (success) {
-                    // Two-tone rising beep: confirmation
-                    osc.frequency.setValueAtTime(880, ctx.currentTime);
-                    osc.frequency.setValueAtTime(1320, ctx.currentTime + 0.08);
-                    gain.gain.setValueAtTime(0.35, ctx.currentTime);
-                    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.22);
-                    osc.start(ctx.currentTime);
-                    osc.stop(ctx.currentTime + 0.22);
+                    osc.frequency.setValueAtTime(880,  ctx.currentTime);
+                    osc.frequency.setValueAtTime(1320, ctx.currentTime + 0.09);
+                    g.gain.setValueAtTime(0.3, ctx.currentTime);
+                    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.25);
+                    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.25);
                 } else {
-                    // Low single buzz: not found
-                    osc.frequency.setValueAtTime(220, ctx.currentTime);
-                    gain.gain.setValueAtTime(0.25, ctx.currentTime);
-                    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
-                    osc.start(ctx.currentTime);
-                    osc.stop(ctx.currentTime + 0.3);
+                    osc.frequency.setValueAtTime(200, ctx.currentTime);
+                    g.gain.setValueAtTime(0.25, ctx.currentTime);
+                    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+                    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.35);
                 }
-            } catch(e) { /* audio not available */ }
+            } catch(e) {}
         }
 
         // ---- Scanner state ----
-        let scannerStream    = null;
-        let scannerAnimFrame = null;
-        let scannerActive    = false;
-        let torchOn          = false;
-        let torchTrack       = null;   // the video track that supports torch
+        let scannerStream   = null;
+        let scannerInterval = null;   // setInterval handle (not rAF — async-safe)
+        let scannerActive   = false;
+        let torchOn         = false;
+        let torchTrack      = null;
+        let _detector       = null;
+        let _detectorReady  = false;
 
-        // Detect iOS (Safari on iPhone/iPad)
-        const isIOS = /iP(hone|od|ad)/.test(navigator.userAgent) ||
-                      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+        async function initDetector() {
+            if (_detectorReady) return;
+            _detectorReady = true;
+            if (typeof BarcodeDetector === 'undefined') {
+                console.log('BarcodeDetector: not supported on this browser');
+                return;
+            }
+            try {
+                const supported = await BarcodeDetector.getSupportedFormats();
+                const wanted = ['qr_code','code_128','code_39','ean_13','ean_8','itf','aztec','data_matrix','pdf417','upc_a','upc_e'];
+                const formats = supported.filter(f => wanted.includes(f));
+                _detector = new BarcodeDetector({ formats: formats.length ? formats : supported });
+                console.log('BarcodeDetector ready, formats:', formats);
+            } catch(e) {
+                console.warn('BarcodeDetector init error:', e);
+                _detector = null;
+            }
+        }
 
+        // ---- Scanner UI ----
         function openVinScanner() {
             if (!currentUser) return;
             const existing = document.getElementById('vinScannerModal');
             if (existing) existing.remove();
             torchOn = false;
 
-            injectScannerStyles();
-
-            // iOS: use native camera capture (file input with capture attribute)
-            // This gives full autofocus, HDR, and works perfectly on every iPhone
-            if (isIOS) {
-                openIOSScanner();
-                return;
-            }
-
-            // Android / Desktop: live video stream scanner
-            openLiveScanner();
-        }
-
-        // ── iOS path: native camera → decode still image ─────────────────
-        function openIOSScanner() {
-            // Create hidden file input with camera capture
-            const inp = document.createElement('input');
-            inp.type = 'file';
-            inp.accept = 'image/*';
-            inp.setAttribute('capture', 'environment'); // rear camera
-            inp.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;';
-            document.body.appendChild(inp);
-
-            inp.onchange = async (e) => {
-                const file = e.target.files[0];
-                inp.remove();
-                if (!file) return;
-
-                // Show a brief "processing" modal
-                const proc = document.createElement('div');
-                proc.id = 'vinScannerModal';
-                proc.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:5000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;';
-                proc.innerHTML = `
-                    <div style="font-size:48px;">📷</div>
-                    <div style="color:white;font-size:17px;font-weight:700;">Decoding barcode…</div>
-                    <div style="color:#a0aec0;font-size:13px;">Processing image</div>
+            // Inject CSS once
+            if (!document.getElementById('scannerCSS')) {
+                const s = document.createElement('style');
+                s.id = 'scannerCSS';
+                s.textContent = `
+                    @keyframes scanBeam {
+                        0%   { top:4px;  opacity:0.4; }
+                        50%  { top:76px; opacity:1;   }
+                        100% { top:4px;  opacity:0.4; }
+                    }
+                    @keyframes scanPulse {
+                        0%,100% { box-shadow: 0 0 0 0 rgba(99,179,237,0); }
+                        50%     { box-shadow: 0 0 0 6px rgba(99,179,237,0.35); }
+                    }
+                    @keyframes vinSlideUp {
+                        from { transform:translateY(100%); opacity:0; }
+                        to   { transform:translateY(0);    opacity:1; }
+                    }
+                    .scan-corner { position:absolute; width:26px; height:26px; }
+                    .scan-corner.tl { top:0; left:0;  border-top:3px solid #63b3ed; border-left:3px solid #63b3ed;  border-radius:5px 0 0 0; }
+                    .scan-corner.tr { top:0; right:0; border-top:3px solid #63b3ed; border-right:3px solid #63b3ed; border-radius:0 5px 0 0; }
+                    .scan-corner.bl { bottom:0; left:0;  border-bottom:3px solid #63b3ed; border-left:3px solid #63b3ed;  border-radius:0 0 0 5px; }
+                    .scan-corner.br { bottom:0; right:0; border-bottom:3px solid #63b3ed; border-right:3px solid #63b3ed; border-radius:0 0 5px 0; }
+                    #scanBeamLine {
+                        position:absolute; left:10px; right:10px; height:2px;
+                        background:linear-gradient(90deg, transparent 0%, #63b3ed 30%, #90cdf4 50%, #63b3ed 70%, transparent 100%);
+                        animation: scanBeam 2s ease-in-out infinite;
+                        border-radius:1px;
+                    }
+                    #scanZone {
+                        position:relative; width:85%; max-width:340px; height:86px;
+                        animation: scanPulse 2s ease-in-out infinite;
+                        border-radius:8px;
+                    }
+                    #torchBtn.lit {
+                        background:rgba(255,220,50,0.25) !important;
+                        border-color:rgba(255,220,50,0.8) !important;
+                        box-shadow:0 0 14px rgba(255,220,50,0.5) !important;
+                    }
+                    #vinScannerVideo { width:100%; height:100%; object-fit:cover; display:block; }
                 `;
-                document.body.appendChild(proc);
-
-                try {
-                    const result = await decodeImageFile(file);
-                    proc.remove();
-                    if (result) {
-                        playScanBeep(true);
-                        if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
-                        showVinLookupResult(result.replace(/[^A-Za-z0-9]/g,'').toUpperCase(), result, lookupInCache(result.replace(/[^A-Za-z0-9]/g,'').toUpperCase()));
-                    } else {
-                        playScanBeep(false);
-                        if (navigator.vibrate) navigator.vibrate([150]);
-                        // Show manual entry fallback
-                        showIOSManualFallback('Could not read barcode — try better lighting or enter manually');
-                    }
-                } catch(err) {
-                    proc.remove();
-                    showIOSManualFallback('Error processing image');
-                }
-            };
-
-            inp.oncancel = () => inp.remove();
-            inp.click();
-        }
-
-        function showIOSManualFallback(msg) {
-            const modal = document.createElement('div');
-            modal.id = 'vinScannerModal';
-            modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:5000;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;padding:0;';
-            modal.innerHTML = `
-                <div style="width:100%;max-width:480px;background:#1a202c;border-radius:20px 20px 0 0;padding:28px 24px 44px;animation:slideUp 0.3s ease;">
-                    <div style="text-align:center;margin-bottom:20px;">
-                        <div style="font-size:40px;margin-bottom:10px;">⚠️</div>
-                        <div style="color:white;font-size:16px;font-weight:700;margin-bottom:6px;">Barcode Not Detected</div>
-                        <div style="color:#718096;font-size:13px;">${msg}</div>
-                    </div>
-                    <div style="margin-bottom:14px;">
-                        <button onclick="closeVinScanner();openVinScanner();"
-                            style="width:100%;padding:13px;background:#4299e1;color:white;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:10px;">
-                            📷 Try Again
-                        </button>
-                    </div>
-                    <div style="color:#718096;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:7px;">Or enter manually</div>
-                    <div style="display:flex;gap:8px;">
-                        <input id="vinManualInput" type="text" placeholder="VIN or Stock #"
-                            style="flex:1;padding:10px 12px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.2);border-radius:8px;color:white;font-size:14px;outline:none;"
-                            onkeydown="if(event.key==='Enter') lookupVinManual()">
-                        <button onclick="lookupVinManual()"
-                            style="background:#48bb78;color:white;border:none;border-radius:8px;padding:10px 16px;font-size:14px;font-weight:700;cursor:pointer;">
-                            Go
-                        </button>
-                    </div>
-                    <button onclick="closeVinScanner()" style="width:100%;margin-top:14px;padding:11px;background:rgba(255,255,255,0.08);color:#a0aec0;border:none;border-radius:10px;font-size:14px;cursor:pointer;">
-                        Cancel
-                    </button>
-                </div>
-            `;
-            document.body.appendChild(modal);
-        }
-
-        // Decode a File/Blob image using canvas + jsQR + Code128
-        async function decodeImageFile(file) {
-            return new Promise((resolve) => {
-                const img = new Image();
-                const url = URL.createObjectURL(file);
-                img.onload = () => {
-                    URL.revokeObjectURL(url);
-                    // Try multiple canvas sizes for better decode accuracy
-                    const sizes = [
-                        { w: img.naturalWidth,   h: img.naturalHeight },
-                        { w: Math.min(1280, img.naturalWidth), h: Math.round(img.naturalHeight * Math.min(1280, img.naturalWidth) / img.naturalWidth) },
-                        { w: 640, h: Math.round(img.naturalHeight * 640 / img.naturalWidth) }
-                    ];
-                    const cnv = document.createElement('canvas');
-                    const ctx = cnv.getContext('2d', { willReadFrequently: true });
-
-                    for (const { w, h } of sizes) {
-                        cnv.width = w; cnv.height = h;
-                        ctx.drawImage(img, 0, 0, w, h);
-                        const imgData = ctx.getImageData(0, 0, w, h);
-
-                        // Try jsQR
-                        if (typeof jsQR === 'function') {
-                            const qr = jsQR(imgData.data, w, h, { inversionAttempts: 'attemptBoth' });
-                            if (qr && qr.data && qr.data.trim().length >= 4) { resolve(qr.data.trim()); return; }
-                        }
-
-                        // Try Code128 at normal orientation
-                        let r = Code128Decoder.decode(imgData);
-                        if (r) { resolve(r); return; }
-
-                        // Try rotated 90° (sideways barcode on door jamb)
-                        const rot = rotateImageData90(imgData, w, h);
-                        r = Code128Decoder.decode(rot);
-                        if (r) { resolve(r); return; }
-
-                        // Try rotated 270°
-                        const rot270 = rotateImageData90(rot, h, w);
-                        const rot2   = rotateImageData90(rot270, w, h);
-                        r = Code128Decoder.decode(rot2);
-                        if (r) { resolve(r); return; }
-                    }
-                    resolve(null);
-                };
-                img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
-                img.src = url;
-            });
-        }
-
-        // Rotate ImageData 90° clockwise
-        function rotateImageData90(imgData, w, h) {
-            const src = imgData.data;
-            const dst = new Uint8ClampedArray(w * h * 4);
-            for (let y = 0; y < h; y++) {
-                for (let x = 0; x < w; x++) {
-                    const srcIdx = (y * w + x) * 4;
-                    const dstIdx = ((x * h) + (h - 1 - y)) * 4;
-                    dst[dstIdx]     = src[srcIdx];
-                    dst[dstIdx + 1] = src[srcIdx + 1];
-                    dst[dstIdx + 2] = src[srcIdx + 2];
-                    dst[dstIdx + 3] = src[srcIdx + 3];
-                }
+                document.head.appendChild(s);
             }
-            return { data: dst, width: h, height: w };
-        }
 
-        // ── Android/Desktop path: live video scanner ──────────────────────
-        function openLiveScanner() {
             const modal = document.createElement('div');
             modal.id = 'vinScannerModal';
-            // orientation:lock CSS keeps the modal portrait even if phone rotates
-            modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:5000;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:0;overflow:hidden;';
+            modal.style.cssText = 'position:fixed;inset:0;background:#000;z-index:5000;display:flex;flex-direction:column;align-items:center;';
+
+            const cacheLabel = scanCacheReady
+                ? `📦 ${scanCache.length} vehicles ready`
+                : '⏳ Loading inventory…';
+
             modal.innerHTML = `
-                <div style="width:100%;max-width:480px;display:flex;flex-direction:column;height:100%;position:relative;">
-                    <!-- Header -->
-                    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;background:rgba(0,0,0,0.75);backdrop-filter:blur(8px);z-index:10;flex-shrink:0;">
+                <div style="width:100%;max-width:480px;height:100%;display:flex;flex-direction:column;">
+
+                    <!-- Header bar -->
+                    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;background:rgba(0,0,0,0.85);flex-shrink:0;border-bottom:1px solid rgba(255,255,255,0.08);">
                         <div>
-                            <div style="color:white;font-size:17px;font-weight:700;letter-spacing:-0.3px;">📷 VIN / QR Scanner</div>
-                            <div style="color:#a0aec0;font-size:11px;margin-top:1px;">Point at VIN barcode or QR code</div>
+                            <div style="color:#fff;font-size:16px;font-weight:700;letter-spacing:-0.2px;">📷 VIN Scanner</div>
+                            <div style="color:#718096;font-size:11px;margin-top:1px;">Point camera at barcode or QR code</div>
                         </div>
-                        <div style="display:flex;align-items:center;gap:8px;">
-                            <button id="torchBtn" onclick="toggleTorch()" title="Toggle flashlight"
-                                style="background:rgba(255,255,255,0.1);border:2px solid rgba(255,255,255,0.15);color:white;width:40px;height:40px;border-radius:50%;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s;">
+                        <div style="display:flex;gap:8px;align-items:center;">
+                            <button id="torchBtn" onclick="toggleTorch()" title="Flashlight"
+                                style="background:rgba(255,255,255,0.08);border:2px solid rgba(255,255,255,0.12);color:white;
+                                       width:40px;height:40px;border-radius:50%;font-size:18px;cursor:pointer;
+                                       display:flex;align-items:center;justify-content:center;transition:all 0.2s;">
                                 🔦
                             </button>
                             <button onclick="closeVinScanner()"
-                                style="background:rgba(255,255,255,0.1);border:none;color:white;width:40px;height:40px;border-radius:50%;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;">
-                                ✕
-                            </button>
+                                style="background:rgba(255,255,255,0.08);border:none;color:white;
+                                       width:40px;height:40px;border-radius:50%;font-size:20px;cursor:pointer;
+                                       display:flex;align-items:center;justify-content:center;">✕</button>
                         </div>
                     </div>
 
-                    <!-- Camera viewport -->
-                    <div style="position:relative;flex:1;min-height:0;background:#000;overflow:hidden;">
-                        <video id="vinScannerVideo" autoplay playsinline muted
-                            style="width:100%;height:100%;object-fit:cover;display:block;"></video>
+                    <!-- Camera -->
+                    <div style="position:relative;flex:1;min-height:0;background:#111;overflow:hidden;">
+                        <video id="vinScannerVideo" autoplay playsinline muted></video>
 
-                        <!-- Scan overlay -->
+                        <!-- Darkened overlay with cutout effect -->
                         <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none;">
-                            <div id="scanBox" style="position:relative;width:84%;max-width:340px;height:88px;border-radius:10px;">
-                                <div style="position:absolute;top:0;left:0;width:28px;height:28px;border-top:3px solid #63b3ed;border-left:3px solid #63b3ed;border-radius:4px 0 0 0;"></div>
-                                <div style="position:absolute;top:0;right:0;width:28px;height:28px;border-top:3px solid #63b3ed;border-right:3px solid #63b3ed;border-radius:0 4px 0 0;"></div>
-                                <div style="position:absolute;bottom:0;left:0;width:28px;height:28px;border-bottom:3px solid #63b3ed;border-left:3px solid #63b3ed;border-radius:0 0 0 4px;"></div>
-                                <div style="position:absolute;bottom:0;right:0;width:28px;height:28px;border-bottom:3px solid #63b3ed;border-right:3px solid #63b3ed;border-radius:0 0 4px 0;"></div>
-                                <div id="scanLine" style="position:absolute;left:8px;right:8px;height:2px;background:linear-gradient(90deg,transparent,#63b3ed,transparent);top:44px;animation:scanLinePulse 1.8s ease-in-out infinite;"></div>
+                            <!-- dim top -->
+                            <div style="flex:1;width:100%;background:rgba(0,0,0,0.45);"></div>
+                            <!-- middle row: dim | scan zone | dim -->
+                            <div style="display:flex;align-items:stretch;width:100%;">
+                                <div style="flex:1;background:rgba(0,0,0,0.45);"></div>
+                                <!-- THE SCAN ZONE -->
+                                <div id="scanZone">
+                                    <div class="scan-corner tl"></div>
+                                    <div class="scan-corner tr"></div>
+                                    <div class="scan-corner bl"></div>
+                                    <div class="scan-corner br"></div>
+                                    <div id="scanBeamLine"></div>
+                                </div>
+                                <div style="flex:1;background:rgba(0,0,0,0.45);"></div>
                             </div>
-                            <div style="margin-top:12px;color:rgba(255,255,255,0.65);font-size:12px;text-align:center;padding:0 20px;">
-                                Align VIN barcode or QR sticker within the frame
+                            <!-- hint text -->
+                            <div style="padding:10px 20px;background:rgba(0,0,0,0.45);width:100%;text-align:center;">
+                                <div style="color:rgba(255,255,255,0.6);font-size:12px;">Center the VIN barcode or QR code in the frame</div>
                             </div>
+                            <!-- dim bottom -->
+                            <div style="flex:1;width:100%;background:rgba(0,0,0,0.45);"></div>
                         </div>
 
-                        <!-- Status badge -->
-                        <div id="scannerStatusBadge"
-                            style="position:absolute;top:12px;left:50%;transform:translateX(-50%);background:rgba(66,153,225,0.9);color:white;padding:5px 14px;border-radius:20px;font-size:12px;font-weight:600;white-space:nowrap;backdrop-filter:blur(4px);">
-                            🔍 Scanning…
+                        <!-- Status chip -->
+                        <div id="scanChip" style="position:absolute;top:10px;left:50%;transform:translateX(-50%);
+                            background:rgba(66,153,225,0.92);color:white;padding:5px 16px;
+                            border-radius:20px;font-size:12px;font-weight:700;white-space:nowrap;
+                            backdrop-filter:blur(6px);box-shadow:0 2px 8px rgba(0,0,0,0.3);">
+                            🔍 Ready to scan…
                         </div>
 
-                        <!-- Cache status pill -->
-                        <div id="cacheStatusPill"
-                            style="position:absolute;bottom:10px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.55);color:#a0aec0;padding:4px 12px;border-radius:20px;font-size:10px;font-weight:600;white-space:nowrap;">
-                            ${scanCacheReady ? '📦 ' + scanCache.length + ' vehicles cached' : '⏳ Loading inventory…'}
+                        <!-- Cache pill -->
+                        <div style="position:absolute;bottom:8px;left:50%;transform:translateX(-50%);
+                            background:rgba(0,0,0,0.6);color:#a0aec0;padding:3px 12px;
+                            border-radius:20px;font-size:10px;font-weight:600;white-space:nowrap;">
+                            ${cacheLabel}
                         </div>
                     </div>
 
-                    <!-- Manual input -->
-                    <div style="padding:14px 16px 18px;background:rgba(0,0,0,0.82);flex-shrink:0;">
-                        <div style="color:#718096;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:7px;">
-                            Or enter VIN / Stock # manually
+                    <!-- Manual fallback -->
+                    <div style="padding:14px 16px 20px;background:rgba(0,0,0,0.9);flex-shrink:0;">
+                        <div style="color:#4a5568;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px;">
+                            Manual entry
                         </div>
                         <div style="display:flex;gap:8px;">
-                            <input id="vinManualInput" type="text"
-                                placeholder="e.g. 1HGBH41JXMN109186 or A12345"
-                                style="flex:1;padding:10px 12px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);border-radius:8px;color:white;font-size:14px;outline:none;"
-                                onkeydown="if(event.key==='Enter') lookupVinManual()"
-                            >
+                            <input id="vinManualInput" type="text" placeholder="VIN or Stock #"
+                                style="flex:1;padding:10px 13px;background:rgba(255,255,255,0.07);
+                                       border:1px solid rgba(255,255,255,0.12);border-radius:8px;
+                                       color:white;font-size:14px;outline:none;"
+                                onkeydown="if(event.key==='Enter') lookupVinManual()">
                             <button onclick="lookupVinManual()"
-                                style="background:#4299e1;color:white;border:none;border-radius:8px;padding:10px 16px;font-size:14px;font-weight:700;cursor:pointer;white-space:nowrap;">
-                                Look Up
+                                style="background:#4299e1;color:white;border:none;border-radius:8px;
+                                       padding:10px 18px;font-size:14px;font-weight:700;cursor:pointer;">
+                                Go
                             </button>
                         </div>
                     </div>
@@ -7767,274 +7671,80 @@ Assign a workflow when the vehicle arrives.`);
             `;
 
             document.body.appendChild(modal);
-            lockOrientation();
             startScannerCamera();
         }
 
-        function injectScannerStyles() {
-            if (document.getElementById('scannerStyles')) return;
-            const st = document.createElement('style');
-            st.id = 'scannerStyles';
-            st.textContent = `
-                @keyframes scanLinePulse {
-                    0%,100% { opacity:0.3; top:8px; }
-                    50%      { opacity:1;   top:74px; }
-                }
-                @keyframes slideUp {
-                    from { transform:translateY(100%); opacity:0; }
-                    to   { transform:translateY(0);    opacity:1; }
-                }
-                #torchBtn.torch-on {
-                    background: rgba(255,220,50,0.25) !important;
-                    border-color: rgba(255,220,50,0.7) !important;
-                    box-shadow: 0 0 12px rgba(255,220,50,0.4);
-                }
-                /* Orientation lock: keep scanner modal portrait regardless of device rotation */
-                #vinScannerModal {
-                    transform-origin: top left;
-                }
-                @media screen and (orientation: landscape) {
-                    #vinScannerModal {
-                        width: 100vh !important;
-                        height: 100vw !important;
-                        transform: rotate(-90deg) translateX(-100%);
-                    }
-                }
-            `;
-            document.head.appendChild(st);
-        }
-
-        // Lock orientation via Screen Orientation API (Android Chrome supports this)
-        function lockOrientation() {
-            try {
-                if (screen.orientation && screen.orientation.lock) {
-                    screen.orientation.lock('portrait').catch(() => {});
-                }
-            } catch(e) {}
-        }
-
-        function unlockOrientation() {
-            try {
-                if (screen.orientation && screen.orientation.unlock) {
-                    screen.orientation.unlock();
-                }
-            } catch(e) {}
-        }
-
-        // ── Inline Code-128 barcode decoder (no CDN needed) ──────────────
-        // Decodes Code128 A/B/C from a row of pixel data.
-        // Returns decoded string or null.
-        const Code128Decoder = (() => {
-            // Code128 bar-widths table: each symbol = 6 elements (3 bars, 3 spaces) in units
-            const SYMBOLS = [
-                [2,1,2,2,2,2],[2,2,2,1,2,2],[2,2,2,2,2,1],[1,2,1,2,2,3],
-                [1,2,1,3,2,2],[1,3,1,2,2,2],[1,2,2,2,1,3],[1,2,2,3,1,2],
-                [1,3,2,2,1,2],[2,2,1,2,1,3],[2,2,1,3,1,2],[2,3,1,2,1,2],
-                [1,1,2,2,3,2],[1,2,2,1,3,2],[1,2,2,2,3,1],[1,1,3,2,2,2],
-                [1,2,3,1,2,2],[1,2,3,2,2,1],[2,2,3,2,1,1],[2,2,1,1,3,2],
-                [2,2,1,2,3,1],[2,1,3,2,1,2],[2,2,3,1,1,2],[3,1,2,1,3,1],
-                [3,1,1,2,2,2],[3,2,1,1,2,2],[3,2,1,2,2,1],[3,1,2,2,1,2],
-                [3,2,2,1,1,2],[3,2,2,2,1,1],[2,1,2,1,2,3],[2,1,2,3,2,1],
-                [2,3,2,1,2,1],[1,1,1,3,2,3],[1,3,1,1,2,3],[1,3,1,3,2,1],
-                [1,1,2,3,1,3],[1,3,2,1,1,3],[1,3,2,3,1,1],[2,1,1,3,1,3],
-                [2,3,1,1,1,3],[2,3,1,3,1,1],[1,1,2,1,3,3],[1,1,2,3,3,1],
-                [1,3,2,1,3,1],[1,1,3,1,2,3],[1,1,3,3,2,1],[1,3,3,1,2,1],
-                [3,1,3,1,2,1],[2,1,1,3,3,1],[2,3,1,1,3,1],[2,1,3,1,1,3],
-                [2,1,3,3,1,1],[2,1,3,1,3,1],[3,1,1,1,2,3],[3,1,1,3,2,1],
-                [3,3,1,1,2,1],[3,1,2,1,1,3],[3,1,2,3,1,1],[3,3,2,1,1,1],
-                [3,1,4,1,1,1],[2,2,1,4,1,1],[4,3,1,1,1,1],[1,1,1,2,2,4],
-                [1,1,1,4,2,2],[1,2,1,1,2,4],[1,2,1,4,2,1],[1,4,1,1,2,2],
-                [1,4,1,2,2,1],[1,1,2,2,1,4],[1,1,2,4,1,2],[1,2,2,1,1,4],
-                [1,2,2,4,1,1],[1,4,2,1,1,2],[1,4,2,2,1,1],[2,4,1,2,1,1],
-                [2,2,1,1,1,4],[4,1,3,1,1,1],[2,4,1,1,1,2],[1,3,4,1,1,1],
-                [1,1,1,2,4,2],[1,2,1,1,4,2],[1,2,1,2,4,1],[1,1,4,2,1,2],
-                [1,2,4,1,1,2],[1,2,4,2,1,1],[4,1,1,2,1,2],[4,2,1,1,1,2],
-                [4,2,1,2,1,1],[2,1,2,1,4,1],[2,1,4,1,2,1],[4,1,2,1,2,1],
-                [1,1,1,1,4,3],[1,1,1,3,4,1],[1,3,1,1,4,1],[1,1,4,1,1,3],
-                [1,1,4,3,1,1],[4,1,1,1,1,3],[4,1,1,3,1,1],[1,1,3,1,4,1],
-                [1,1,4,1,3,1],[3,1,1,1,4,1],[4,1,1,1,3,1],[2,1,1,4,1,2],
-                [2,1,1,2,1,4],[2,1,1,2,3,2]
-            ];
-            const START_A = 103, START_B = 104, START_C = 105, STOP = 106;
-            function matchSymbol(runs) {
-                const total = runs.reduce((a, b) => a + b, 0);
-                for (let s = 0; s < SYMBOLS.length; s++) {
-                    const symTotal = SYMBOLS[s].reduce((a, b) => a + b, 0);
-                    let ok = true;
-                    for (let i = 0; i < 6; i++) {
-                        const expected = SYMBOLS[s][i] / symTotal * total;
-                        if (Math.abs(runs[i] - expected) > expected * 0.35 + 1) { ok = false; break; }
-                    }
-                    if (ok) return s;
-                }
-                return -1;
-            }
-            function decodeLine(pixels, threshold) {
-                // Convert to black/white run-lengths
-                let runs = [], cur = pixels[0] < threshold, count = 0;
-                for (let i = 0; i < pixels.length; i++) {
-                    const dark = pixels[i] < threshold;
-                    if (dark === cur) { count++; }
-                    else { runs.push(count); count = 1; cur = dark; }
-                }
-                runs.push(count);
-                // Must start on a dark bar
-                let idx = cur ? 1 : 0; // if last was light, start is dark at 0; else skip 1
-                idx = 0;
-                if (pixels[0] >= threshold) idx = 1; // skip leading quiet zone bar
-                
-                // Collect 6-element windows
-                let syms = [];
-                for (; idx + 5 < runs.length; idx += 6) {
-                    const s = matchSymbol(runs.slice(idx, idx + 6));
-                    if (s === -1) return null;
-                    syms.push(s);
-                    if (s === STOP) break;
-                }
-                if (syms.length < 3) return null;
-                const startSym = syms[0];
-                if (startSym !== START_A && startSym !== START_B && startSym !== START_C) return null;
-                const stopSym = syms[syms.length - 1];
-                if (stopSym !== STOP) return null;
-                
-                let mode = startSym === START_A ? 'A' : startSym === START_B ? 'B' : 'C';
-                let result = '';
-                const data = syms.slice(1, syms.length - 1); // strip start/stop
-                for (let i = 0; i < data.length - 1; i++) { // -1 strips checksum
-                    const v = data[i];
-                    if (mode === 'C') {
-                        result += String(v).padStart(2, '0');
-                    } else if (mode === 'B') {
-                        if (v >= 0 && v <= 94) result += String.fromCharCode(v + 32);
-                        else if (v === 100) mode = 'A';
-                        else if (v === 99)  mode = 'C';
-                    } else {
-                        if (v >= 0 && v <= 63)  result += String.fromCharCode(v + 32);
-                        else if (v >= 64 && v <= 95) result += String.fromCharCode(v - 64);
-                        else if (v === 101) mode = 'B';
-                        else if (v === 99)  mode = 'C';
-                    }
-                }
-                return result.length >= 4 ? result : null;
-            }
-            function decode(imageData) {
-                const { data, width, height } = imageData;
-                // Sample multiple horizontal scan lines
-                const rows = [0.25, 0.35, 0.45, 0.5, 0.55, 0.65, 0.75].map(f => Math.floor(f * height));
-                for (const row of rows) {
-                    const pixels = [];
-                    for (let x = 0; x < width; x++) {
-                        const i = (row * width + x) * 4;
-                        pixels.push(0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2]);
-                    }
-                    // Adaptive threshold
-                    const avg = pixels.reduce((a, b) => a + b, 0) / pixels.length;
-                    const result = decodeLine(pixels, avg * 0.85);
-                    if (result) return result;
-                    const result2 = decodeLine(pixels, 128);
-                    if (result2) return result2;
-                }
-                return null;
-            }
-            return { decode };
-        })();
-        // ── End inline Code-128 decoder ──────────────────────────────────
-
-        // Shared scan canvas (reused across frames)
-        let _scanCanvas = null;
-        let _scanCtx = null;
-
         async function startScannerCamera() {
             scannerActive = true;
-            torchTrack = null;
+            torchTrack    = null;
             const video = document.getElementById('vinScannerVideo');
-            const badge = document.getElementById('scannerStatusBadge');
+            const chip  = document.getElementById('scanChip');
 
-            // Pre-create canvas for frame capture
-            _scanCanvas = document.createElement('canvas');
-            _scanCtx    = _scanCanvas.getContext('2d', { willReadFrequently: true });
+            // Pre-init detector while camera starts
+            initDetector();
 
             try {
                 scannerStream = await navigator.mediaDevices.getUserMedia({
                     video: {
                         facingMode: { ideal: 'environment' },
-                        width:  { ideal: 1280 },
-                        height: { ideal: 720 }
+                        width:  { ideal: 1920 },
+                        height: { ideal: 1080 }
                     }
                 });
                 video.srcObject = scannerStream;
                 await video.play();
 
-                // Torch support
+                // Torch capability
                 const tracks = scannerStream.getVideoTracks();
-                if (tracks.length > 0) {
+                if (tracks.length) {
                     torchTrack = tracks[0];
                     const caps = torchTrack.getCapabilities ? torchTrack.getCapabilities() : {};
-                    const torchBtn = document.getElementById('torchBtn');
-                    if (torchBtn) torchBtn.style.display = caps.torch ? 'flex' : 'none';
+                    const btn  = document.getElementById('torchBtn');
+                    if (btn) btn.style.display = caps.torch ? 'flex' : 'none';
                 }
 
-                if (badge) badge.textContent = '🔍 Scanning…';
+                if (chip) chip.textContent = '🔍 Scanning…';
 
-                // Use native BarcodeDetector if available, otherwise our canvas approach
-                if (typeof BarcodeDetector !== 'undefined') {
-                    let nativeDet;
-                    try {
-                        nativeDet = new BarcodeDetector({
-                            formats: ['qr_code','code_128','code_39','ean_13','itf','aztec','data_matrix','upc_a','upc_e','code_93']
-                        });
-                    } catch(e) { nativeDet = null; }
-                    if (nativeDet) {
-                        console.log('Using native BarcodeDetector');
-                        const loop = async () => {
-                            if (!scannerActive) return;
-                            if (video.readyState >= 2) {
-                                try {
-                                    const barcodes = await nativeDet.detect(video);
-                                    if (barcodes && barcodes.length > 0 && barcodes[0].rawValue.trim().length >= 4) {
-                                        handleScanResult(barcodes[0].rawValue.trim()); return;
-                                    }
-                                } catch(e) {}
-                            }
-                            if (scannerActive) scannerAnimFrame = requestAnimationFrame(loop);
-                        };
-                        scannerAnimFrame = requestAnimationFrame(loop);
-                        return;
-                    }
-                }
+                // Use setInterval instead of rAF — safer for async BarcodeDetector
+                scannerInterval = setInterval(runScanTick, 200); // 5fps is plenty
 
-                // Canvas-based fallback: captures frame → tries jsQR (if loaded) + Code128
-                console.log('Using canvas decoder fallback');
-                const canvasLoop = () => {
-                    if (!scannerActive) return;
-                    if (video.readyState >= 2 && video.videoWidth > 0) {
-                        const W = video.videoWidth, H = video.videoHeight;
-                        _scanCanvas.width = W; _scanCanvas.height = H;
-                        _scanCtx.drawImage(video, 0, 0, W, H);
-                        const imgData = _scanCtx.getImageData(0, 0, W, H);
-
-                        // Try jsQR (QR codes) if available
-                        if (typeof jsQR === 'function') {
-                            const qr = jsQR(imgData.data, W, H, { inversionAttempts: 'attemptBoth' });
-                            if (qr && qr.data && qr.data.trim().length >= 4) {
-                                handleScanResult(qr.data.trim()); return;
-                            }
-                        }
-
-                        // Try Code128 (VIN barcodes are almost always Code128)
-                        const code128 = Code128Decoder.decode(imgData);
-                        if (code128) { handleScanResult(code128); return; }
-                    }
-                    if (scannerActive) scannerAnimFrame = setTimeout(canvasLoop, 120); // ~8fps
-                };
-                canvasLoop();
-
-            } catch (err) {
+            } catch(err) {
                 console.warn('Camera error:', err);
-                if (badge) {
-                    badge.style.background = 'rgba(229,62,62,0.9)';
-                    badge.textContent = '📵 Camera unavailable — use manual entry';
+                if (chip) {
+                    chip.style.background = 'rgba(229,62,62,0.9)';
+                    chip.textContent = '📵 No camera — use manual entry';
                 }
+            }
+        }
+
+        async function runScanTick() {
+            if (!scannerActive) return;
+            const video = document.getElementById('vinScannerVideo');
+            if (!video || video.readyState < 2 || video.videoWidth === 0) return;
+
+            // Wait for detector to be ready
+            if (!_detectorReady) return;
+
+            if (!_detector) {
+                // BarcodeDetector not supported on this browser
+                const chip = document.getElementById('scanChip');
+                if (chip && chip.textContent.includes('Scanning')) {
+                    chip.style.background = 'rgba(113,128,150,0.9)';
+                    chip.textContent = '⌨️ Camera active — use manual entry';
+                }
+                return;
+            }
+
+            try {
+                const results = await _detector.detect(video);
+                if (results && results.length > 0) {
+                    const raw = results[0].rawValue;
+                    if (raw && raw.trim().length >= 4) {
+                        handleScanResult(raw.trim());
+                    }
+                }
+            } catch(e) {
+                // Frame decode error — just skip this tick
             }
         }
 
@@ -8045,213 +7755,208 @@ Assign a workflow when the vehicle arrives.`);
                 await torchTrack.applyConstraints({ advanced: [{ torch: torchOn }] });
                 const btn = document.getElementById('torchBtn');
                 if (btn) {
-                    btn.classList.toggle('torch-on', torchOn);
-                    btn.title = torchOn ? 'Turn off flashlight' : 'Turn on flashlight';
+                    btn.classList.toggle('lit', torchOn);
+                    btn.title = torchOn ? 'Turn flashlight off' : 'Turn flashlight on';
                 }
             } catch(e) {
-                console.warn('Torch toggle failed:', e);
-                torchOn = !torchOn;
+                console.warn('Torch error:', e);
+                torchOn = !torchOn; // revert
             }
         }
-
-        // Legacy stubs — scanning is now inside startScannerCamera
-        function getBarcodeDetector() { return null; }
-        async function scanFrame() {}
 
         function handleScanResult(raw) {
             if (!scannerActive) return;
             scannerActive = false;
 
-            // Turn off torch if it was on
+            clearInterval(scannerInterval);
+            scannerInterval = null;
+
+            // Turn off torch
             if (torchOn && torchTrack) {
                 try { torchTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch(e) {}
                 torchOn = false;
             }
-
-            // Stop camera
-            if (scannerStream) scannerStream.getTracks().forEach(t => t.stop());
-            cancelAnimationFrame(scannerAnimFrame);
+            if (scannerStream) { scannerStream.getTracks().forEach(t => t.stop()); scannerStream = null; }
 
             const cleaned = raw.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-
-            // Look up in cache first (instant, no network)
             const hit = lookupInCache(cleaned);
 
-            // Visual feedback
-            const badge = document.getElementById('scannerStatusBadge');
-            if (badge) {
-                badge.style.background = hit ? 'rgba(72,187,120,0.95)' : 'rgba(229,62,62,0.9)';
-                badge.textContent = hit ? '✅ Found!' : '🚫 Not in recon';
+            // Visual flash
+            const chip = document.getElementById('scanChip');
+            if (chip) {
+                chip.style.background = hit ? 'rgba(72,187,120,0.95)' : 'rgba(229,62,62,0.92)';
+                chip.textContent = hit ? '✅ Found!' : '🚫 Not in recon';
             }
 
-            // Audio + haptic feedback
+            // Sound + haptic
             playScanBeep(!!hit);
-            if (navigator.vibrate) navigator.vibrate(hit ? [60, 30, 60] : [150]);
+            if (navigator.vibrate) navigator.vibrate(hit ? [60,30,60] : [180]);
 
             setTimeout(() => {
                 closeVinScanner();
-                showVinLookupResult(cleaned, raw, hit);
-            }, 500);
+                showVinResult(cleaned, raw, hit);
+            }, 550);
         }
 
         function lookupVinManual() {
-            const val = document.getElementById('vinManualInput')?.value?.trim();
+            const input = document.getElementById('vinManualInput');
+            const val   = (input?.value || '').trim();
             if (!val) return;
             const cleaned = val.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
             const hit = lookupInCache(cleaned);
-            // Resume audio context on user gesture
             try { if (_audioCtx && _audioCtx.state === 'suspended') _audioCtx.resume(); } catch(e) {}
             playScanBeep(!!hit);
             closeVinScanner();
-            showVinLookupResult(cleaned, val, hit);
+            showVinResult(cleaned, val, hit);
         }
 
-        function showVinLookupResult(query, rawInput, cachedVehicle) {
-            // Use cached result if available, otherwise fall back to live vehicles array
-            const vehicle = cachedVehicle || (() => {
+        function showVinResult(query, rawInput, cachedVehicle) {
+            // Resolve full vehicle: use cache hit first, then scan live array
+            const vehicle = cachedVehicle ? (
+                vehicles.find(v =>
+                    (v.vin||'').toUpperCase()         === cachedVehicle.vin ||
+                    (v.stockNumber||'').toUpperCase() === cachedVehicle.stockNumber
+                ) || cachedVehicle
+            ) : (() => {
                 const q = query.toLowerCase();
                 return vehicles.find(v =>
-                    (v.vin || '').toLowerCase() === q ||
-                    (v.stockNumber || v.stock_number || '').toLowerCase() === q ||
-                    (v.vin || '').toLowerCase().includes(q) ||
-                    (v.stockNumber || v.stock_number || '').toLowerCase().includes(q)
+                    (v.vin||'').toLowerCase() === q ||
+                    (v.stockNumber||v.stock_number||'').toLowerCase() === q ||
+                    (v.vin||'').toLowerCase().includes(q) ||
+                    (v.stockNumber||v.stock_number||'').toLowerCase().includes(q)
                 );
             })();
 
             const existing = document.getElementById('vinResultModal');
             if (existing) existing.remove();
 
-            injectScannerStyles();
-
             const modal = document.createElement('div');
             modal.id = 'vinResultModal';
-            modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:5000;display:flex;align-items:flex-end;justify-content:center;padding:0;';
+            modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:5000;display:flex;align-items:flex-end;justify-content:center;';
             modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
 
             if (!vehicle) {
                 modal.innerHTML = `
-                    <div style="background:white;width:100%;max-width:480px;border-radius:20px 20px 0 0;padding:28px 24px 40px;animation:slideUp 0.3s ease;">
-                        <div style="text-align:center;margin-bottom:20px;">
-                            <div style="font-size:56px;margin-bottom:12px;">🚫</div>
-                            <div style="font-size:20px;font-weight:800;color:#1a202c;margin-bottom:6px;">Not in Recon</div>
-                            <div style="font-size:14px;color:#718096;">This vehicle is not currently in the recon process.</div>
+                    <div style="background:white;width:100%;max-width:480px;border-radius:22px 22px 0 0;
+                                padding:28px 22px 44px;animation:vinSlideUp 0.3s ease;">
+                        <div style="text-align:center;margin-bottom:22px;">
+                            <div style="font-size:52px;margin-bottom:10px;">🚫</div>
+                            <div style="font-size:21px;font-weight:800;color:#1a202c;margin-bottom:5px;">Not in Recon</div>
+                            <div style="font-size:14px;color:#718096;">Vehicle not found in the recon system.</div>
                         </div>
-                        <div style="background:#f7fafc;border-radius:10px;padding:14px 16px;margin-bottom:20px;border:1px solid #e2e8f0;">
-                            <div style="font-size:11px;color:#a0aec0;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px;">Scanned Code</div>
-                            <div style="font-family:monospace;font-size:15px;color:#4a5568;word-break:break-all;">${rawInput}</div>
+                        <div style="background:#f7fafc;border-radius:10px;padding:13px 15px;margin-bottom:18px;border:1px solid #e2e8f0;">
+                            <div style="font-size:10px;color:#a0aec0;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Scanned</div>
+                            <div style="font-family:monospace;font-size:14px;color:#4a5568;word-break:break-all;">${rawInput}</div>
                         </div>
-                        <button onclick="document.getElementById('vinResultModal').remove();openVinScanner();"
-                            style="width:100%;padding:13px;background:#4299e1;color:white;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:10px;">
-                            🔄 Scan Again
-                        </button>
-                        <button onclick="document.getElementById('vinResultModal').remove();"
-                            style="width:100%;padding:13px;background:#edf2f7;color:#4a5568;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;">
-                            Close
-                        </button>
-                    </div>
-                `;
+                        <div style="display:flex;flex-direction:column;gap:10px;">
+                            <button onclick="document.getElementById('vinResultModal').remove();openVinScanner();"
+                                style="padding:13px;background:#4299e1;color:white;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;">
+                                🔄 Scan Again
+                            </button>
+                            <button onclick="document.getElementById('vinResultModal').remove();"
+                                style="padding:13px;background:#edf2f7;color:#4a5568;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;">
+                                Close
+                            </button>
+                        </div>
+                    </div>`;
             } else {
-                // Get full vehicle object from live array for accurate step data
-                const liveVehicle = vehicles.find(v =>
-                    (v.vin||'').toUpperCase() === vehicle.vin ||
-                    (v.stockNumber||v.stock_number||'').toUpperCase() === vehicle.stockNumber
-                ) || vehicle;
+                const wf        = workflows[vehicle.workflow] || workflows[Object.keys(workflows)[0]];
+                const wfSteps   = (wf ? wf.steps : STEPS).filter(s => s !== 'Awaiting Arrival');
+                const total     = wfSteps.length;
+                const done      = (vehicle.completedSteps || []).filter(s => wfSteps.includes(s)).length;
+                const pct       = total > 0 ? Math.round((done / total) * 100) : 0;
+                const finished  = vehicle.currentStep === 'Finished';
+                const barColor  = finished ? '#48bb78' : '#4299e1';
+                const stepLabel = finished ? 'Finished ✅' : vehicle.currentStep;
 
-                const wf = workflows[liveVehicle.workflow] || workflows[Object.keys(workflows)[0]];
-                const wfSteps = (wf ? wf.steps : STEPS).filter(s => s !== 'Awaiting Arrival');
-                const totalSteps = wfSteps.length;
-                const completedCount = (liveVehicle.completedSteps || []).filter(s => wfSteps.includes(s)).length;
-                const pct = totalSteps > 0 ? Math.round((completedCount / totalSteps) * 100) : 0;
-                const isFinished = liveVehicle.currentStep === 'Finished';
-                const statusColor = isFinished ? '#48bb78' : '#4299e1';
-                const statusLabel = isFinished ? 'Finished ✅' : liveVehicle.currentStep;
-
-                const pipelineHTML = wfSteps.map((step, i) => {
-                    const done    = (liveVehicle.completedSteps || []).includes(step);
-                    const current = liveVehicle.currentStep === step;
-                    const bg  = done ? '#48bb78' : current ? '#4299e1' : '#e2e8f0';
-                    const col = done || current ? 'white' : '#a0aec0';
-                    const icon = done ? '✓' : current ? '▶' : (i + 1);
-                    const label = step.length > 8 ? step.slice(0,7)+'…' : step;
-                    return `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;flex:1;min-width:46px;">
-                        <div style="width:32px;height:32px;border-radius:50%;background:${bg};color:${col};display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;">${icon}</div>
-                        <div style="font-size:9px;color:${current?'#2b6cb0':done?'#276749':'#a0aec0'};font-weight:${current?700:500};text-align:center;line-height:1.2;">${label}</div>
+                const pipeline = wfSteps.map((step, i) => {
+                    const isDone    = (vehicle.completedSteps || []).includes(step);
+                    const isCurrent = vehicle.currentStep === step;
+                    const bg  = isDone ? '#48bb78' : isCurrent ? '#4299e1' : '#e2e8f0';
+                    const fg  = isDone || isCurrent ? 'white' : '#a0aec0';
+                    const ico = isDone ? '✓' : isCurrent ? '▶' : (i + 1);
+                    const lbl = step.length > 9 ? step.slice(0,8)+'…' : step;
+                    return `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;flex:1;min-width:44px;">
+                        <div style="width:30px;height:30px;border-radius:50%;background:${bg};color:${fg};
+                                    display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;">${ico}</div>
+                        <div style="font-size:9px;color:${isCurrent?'#2b6cb0':isDone?'#276749':'#a0aec0'};
+                                    font-weight:${isCurrent?700:500};text-align:center;line-height:1.2;">${lbl}</div>
                     </div>`;
                 }).join('');
 
                 modal.innerHTML = `
-                    <div style="background:white;width:100%;max-width:480px;border-radius:20px 20px 0 0;overflow:hidden;animation:slideUp 0.3s ease;">
-                        <!-- Status strip -->
-                        <div style="background:${statusColor};padding:18px 22px 14px;color:white;">
-                            <div style="display:flex;align-items:center;justify-content:space-between;">
+                    <div style="background:white;width:100%;max-width:480px;border-radius:22px 22px 0 0;
+                                overflow:hidden;animation:vinSlideUp 0.3s ease;">
+                        <!-- color header -->
+                        <div style="background:${barColor};padding:18px 20px 14px;color:white;">
+                            <div style="display:flex;justify-content:space-between;align-items:flex-start;">
                                 <div>
-                                    <div style="font-size:19px;font-weight:800;letter-spacing:-0.4px;">
-                                        ${liveVehicle.year || ''} ${liveVehicle.make || ''} ${liveVehicle.model || ''}
+                                    <div style="font-size:19px;font-weight:800;letter-spacing:-0.3px;">
+                                        ${vehicle.year||''} ${vehicle.make||''} ${vehicle.model||''}
                                     </div>
                                     <div style="font-size:12px;opacity:0.85;margin-top:2px;">
-                                        Stock: ${liveVehicle.stockNumber || liveVehicle.stock_number || '—'}
+                                        Stock: ${vehicle.stockNumber||vehicle.stock_number||'—'}
                                     </div>
                                 </div>
                                 <div style="text-align:right;">
-                                    <div style="font-size:10px;opacity:0.75;text-transform:uppercase;letter-spacing:0.05em;">Current Step</div>
-                                    <div style="font-size:15px;font-weight:800;">${statusLabel}</div>
+                                    <div style="font-size:10px;opacity:0.7;text-transform:uppercase;letter-spacing:0.05em;">Current Step</div>
+                                    <div style="font-size:15px;font-weight:800;">${stepLabel}</div>
                                 </div>
                             </div>
                         </div>
 
-                        <div style="padding:18px 22px 0;max-height:60vh;overflow-y:auto;">
-                            <!-- Progress -->
-                            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:7px;">
+                        <div style="padding:18px 20px;max-height:55vh;overflow-y:auto;-webkit-overflow-scrolling:touch;">
+                            <!-- progress bar -->
+                            <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
                                 <div style="font-size:13px;font-weight:700;color:#2d3748;">Recon Progress</div>
-                                <div style="font-size:13px;font-weight:700;color:${statusColor};">${completedCount}/${totalSteps} steps · ${pct}%</div>
+                                <div style="font-size:13px;font-weight:700;color:${barColor};">${done}/${total} · ${pct}%</div>
                             </div>
                             <div style="background:#e2e8f0;border-radius:20px;height:7px;overflow:hidden;margin-bottom:16px;">
-                                <div style="background:${statusColor};height:100%;width:${pct}%;border-radius:20px;"></div>
+                                <div style="background:${barColor};height:100%;width:${pct}%;border-radius:20px;transition:width 0.4s;"></div>
                             </div>
 
-                            <!-- Pipeline -->
-                            <div style="font-size:10px;color:#a0aec0;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:9px;">Step Pipeline</div>
-                            <div style="display:flex;gap:3px;align-items:flex-start;overflow-x:auto;padding-bottom:8px;scrollbar-width:none;-webkit-overflow-scrolling:touch;">
-                                ${pipelineHTML}
+                            <!-- step pipeline -->
+                            <div style="font-size:10px;color:#a0aec0;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">
+                                Pipeline
+                            </div>
+                            <div style="display:flex;gap:3px;overflow-x:auto;padding-bottom:6px;scrollbar-width:none;-webkit-overflow-scrolling:touch;">
+                                ${pipeline}
                             </div>
 
-                            <!-- Details grid -->
-                            <div style="background:#f7fafc;border-radius:10px;padding:12px 14px;margin-top:14px;display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                            <!-- details -->
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px;
+                                        background:#f7fafc;border-radius:10px;padding:12px 14px;">
                                 <div>
-                                    <div style="font-size:10px;color:#a0aec0;font-weight:600;text-transform:uppercase;margin-bottom:2px;">Tech Assigned</div>
-                                    <div style="font-size:13px;font-weight:600;color:#2d3748;">${liveVehicle.assignedTech || 'Unassigned'}</div>
+                                    <div style="font-size:10px;color:#a0aec0;font-weight:600;text-transform:uppercase;margin-bottom:2px;">Tech</div>
+                                    <div style="font-size:13px;font-weight:600;color:#2d3748;">${vehicle.assignedTech||'Unassigned'}</div>
                                 </div>
                                 <div>
                                     <div style="font-size:10px;color:#a0aec0;font-weight:600;text-transform:uppercase;margin-bottom:2px;">Workflow</div>
-                                    <div style="font-size:13px;font-weight:600;color:#2d3748;">${liveVehicle.workflow || '—'}</div>
+                                    <div style="font-size:13px;font-weight:600;color:#2d3748;">${vehicle.workflow||'—'}</div>
                                 </div>
                                 <div>
                                     <div style="font-size:10px;color:#a0aec0;font-weight:600;text-transform:uppercase;margin-bottom:2px;">Time in Step</div>
-                                    <div style="font-size:13px;font-weight:600;color:#2d3748;">${formatTimeDiff(liveVehicle.stepStartTime)}</div>
+                                    <div style="font-size:13px;font-weight:600;color:#2d3748;">${formatTimeDiff(vehicle.stepStartTime)}</div>
                                 </div>
                                 <div>
-                                    <div style="font-size:10px;color:#a0aec0;font-weight:600;text-transform:uppercase;margin-bottom:2px;">Total in System</div>
-                                    <div style="font-size:13px;font-weight:600;color:#2d3748;">${formatTimeDiff(liveVehicle.entryTime)}</div>
+                                    <div style="font-size:10px;color:#a0aec0;font-weight:600;text-transform:uppercase;margin-bottom:2px;">In System</div>
+                                    <div style="font-size:13px;font-weight:600;color:#2d3748;">${formatTimeDiff(vehicle.entryTime)}</div>
                                 </div>
                             </div>
-
-                            <div style="margin-top:10px;font-size:10px;color:#cbd5e0;font-family:monospace;word-break:break-all;">
-                                ${liveVehicle.vin || ''}
-                            </div>
+                            <div style="margin-top:8px;font-size:10px;color:#cbd5e0;font-family:monospace;word-break:break-all;">${vehicle.vin||''}</div>
                         </div>
 
-                        <div style="padding:16px 22px 36px;display:flex;gap:10px;margin-top:4px;">
+                        <div style="padding:12px 20px 38px;display:flex;gap:10px;">
                             <button onclick="document.getElementById('vinResultModal').remove();openVinScanner();"
                                 style="flex:1;padding:13px;background:#edf2f7;color:#4a5568;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;">
                                 🔄 Scan Again
                             </button>
                             <button onclick="document.getElementById('vinResultModal').remove();"
-                                style="flex:1;padding:13px;background:${statusColor};color:white;border:none;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;">
+                                style="flex:1;padding:13px;background:${barColor};color:white;border:none;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;">
                                 Done
                             </button>
                         </div>
-                    </div>
-                `;
+                    </div>`;
             }
 
             document.body.appendChild(modal);
@@ -8259,52 +7964,38 @@ Assign a workflow when the vehicle arrives.`);
 
         function closeVinScanner() {
             scannerActive = false;
-            unlockOrientation();
+            clearInterval(scannerInterval);
+            scannerInterval = null;
             if (torchOn && torchTrack) {
                 try { torchTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch(e) {}
                 torchOn = false;
             }
             if (scannerStream) { scannerStream.getTracks().forEach(t => t.stop()); scannerStream = null; }
-            cancelAnimationFrame(scannerAnimFrame);
-            clearTimeout(scannerAnimFrame);
-            _scanCanvas = null; _scanCtx = null;
-            const modal = document.getElementById('vinScannerModal');
-            if (modal) modal.remove();
+            const m = document.getElementById('vinScannerModal');
+            if (m) m.remove();
         }
 
-        // Floating scan FAB — injected after every render()
         function injectScanButton() {
             const existing = document.getElementById('vinScanFab');
             if (existing) existing.remove();
             if (!currentUser) return;
 
-            // Build scan cache from current vehicles array on first render
             if (!scanCacheReady && vehicles.length > 0) buildScanCache();
 
             const fab = document.createElement('button');
             fab.id = 'vinScanFab';
-            fab.title = 'Scan VIN or QR Code';
-            fab.innerHTML = `
-                <span style="font-size:22px;line-height:1;">📷</span>
-                <span style="font-size:11px;font-weight:700;line-height:1;margin-top:2px;letter-spacing:0.03em;">SCAN</span>
-            `;
+            fab.innerHTML = `<span style="font-size:24px;line-height:1;">📷</span><span style="font-size:10px;font-weight:800;letter-spacing:0.04em;">SCAN</span>`;
             fab.style.cssText = `
-                position:fixed;bottom:24px;right:24px;z-index:4000;
-                width:64px;height:64px;border-radius:50%;
-                background:linear-gradient(135deg,#2b6cb0,#4299e1);
+                position:fixed;bottom:22px;right:22px;z-index:4000;
+                width:62px;height:62px;border-radius:50%;
+                background:linear-gradient(145deg,#2b6cb0,#4299e1);
                 color:white;border:none;cursor:pointer;
-                display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
-                box-shadow:0 6px 24px rgba(66,153,225,0.5);
+                display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;
+                box-shadow:0 5px 20px rgba(66,153,225,0.55);
                 transition:transform 0.15s,box-shadow 0.15s;
             `;
-            fab.addEventListener('mouseenter', () => {
-                fab.style.transform = 'scale(1.08)';
-                fab.style.boxShadow = '0 10px 32px rgba(66,153,225,0.65)';
-            });
-            fab.addEventListener('mouseleave', () => {
-                fab.style.transform = 'scale(1)';
-                fab.style.boxShadow = '0 6px 24px rgba(66,153,225,0.5)';
-            });
+            fab.onmouseenter = () => { fab.style.transform='scale(1.1)'; fab.style.boxShadow='0 8px 28px rgba(66,153,225,0.7)'; };
+            fab.onmouseleave = () => { fab.style.transform='scale(1)';   fab.style.boxShadow='0 5px 20px rgba(66,153,225,0.55)'; };
             fab.onclick = openVinScanner;
             document.body.appendChild(fab);
         }
