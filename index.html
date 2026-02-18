@@ -7527,18 +7527,64 @@ Assign a workflow when the vehicle arrives.`);
             _detectorReady = true; // Set AFTER async work completes
         }
 
-        async function startZxingScanner(video) {
+        async function startZxingScanner(video, chip) {
             if (!window.ZXing) { console.warn('ZXing not loaded'); return; }
             try {
-                _zxingReader = new ZXing.BrowserMultiFormatReader();
-                _zxingReader.decodeFromVideoElement(video, (result, err) => {
-                    if (result && scannerActive) {
+                const hints = new Map();
+                // Tell ZXing to try all common barcode formats
+                hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+                    ZXing.BarcodeFormat.QR_CODE,
+                    ZXing.BarcodeFormat.CODE_128,
+                    ZXing.BarcodeFormat.CODE_39,
+                    ZXing.BarcodeFormat.DATA_MATRIX,
+                    ZXing.BarcodeFormat.PDF_417,
+                    ZXing.BarcodeFormat.EAN_13,
+                    ZXing.BarcodeFormat.ITF,
+                ]);
+                // Higher effort = better decode on low-light iPhone cameras
+                hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+
+                _zxingReader = new ZXing.BrowserMultiFormatReader(hints, 200);
+
+                // On iOS, ZXing MUST control the stream itself via decodeFromConstraints
+                // Passing a pre-existing srcObject stream does NOT work reliably on Safari
+                const constraints = {
+                    video: {
+                        facingMode: { ideal: 'environment' },
+                        width:  { ideal: 1920 },
+                        height: { ideal: 1080 }
+                    }
+                };
+
+                if (chip) chip.textContent = '🔍 Scanning…';
+
+                await _zxingReader.decodeFromConstraints(constraints, video, (result, err) => {
+                    if (!scannerActive) return;
+                    if (result) {
                         handleScanResult(result.getText());
                     }
+                    // err fires on every non-decode frame — that's normal, ignore it
                 });
-                console.log('ZXing scanner active');
+
+                // Capture the stream ZXing started so torch/cleanup work
+                if (video.srcObject) {
+                    scannerStream = video.srcObject;
+                    const tracks = scannerStream.getVideoTracks();
+                    if (tracks.length) {
+                        torchTrack = tracks[0];
+                        const caps = torchTrack.getCapabilities ? torchTrack.getCapabilities() : {};
+                        const btn  = document.getElementById('torchBtn');
+                        if (btn) btn.style.display = caps.torch ? 'flex' : 'none';
+                    }
+                }
+
+                console.log('ZXing scanner active on iOS/Safari');
             } catch(e) {
                 console.warn('ZXing error:', e);
+                if (chip) {
+                    chip.style.background = 'rgba(229,62,62,0.9)';
+                    chip.textContent = '📵 Camera error — use manual entry';
+                }
             }
         }
 
@@ -7707,53 +7753,52 @@ Assign a workflow when the vehicle arrives.`);
             const video = document.getElementById('vinScannerVideo');
             const chip  = document.getElementById('scanChip');
 
-            // Pre-init detector while camera starts
-            initDetector();
+            // Resolve which scanning engine to use
+            await initDetector();
 
-            try {
-                scannerStream = await navigator.mediaDevices.getUserMedia({
-                    video: {
-                        facingMode: { ideal: 'environment' },
-                        width:  { ideal: 1920 },
-                        height: { ideal: 1080 }
+            if (_detector) {
+                // ── Native BarcodeDetector path (Chrome / Edge desktop/Android) ──
+                try {
+                    scannerStream = await navigator.mediaDevices.getUserMedia({
+                        video: {
+                            facingMode: { ideal: 'environment' },
+                            width:  { ideal: 1920 },
+                            height: { ideal: 1080 }
+                        }
+                    });
+                    video.srcObject = scannerStream;
+                    await video.play();
+
+                    const tracks = scannerStream.getVideoTracks();
+                    if (tracks.length) {
+                        torchTrack = tracks[0];
+                        const caps = torchTrack.getCapabilities ? torchTrack.getCapabilities() : {};
+                        const btn  = document.getElementById('torchBtn');
+                        if (btn) btn.style.display = caps.torch ? 'flex' : 'none';
                     }
-                });
-                video.srcObject = scannerStream;
-                await video.play();
 
-                // Torch capability
-                const tracks = scannerStream.getVideoTracks();
-                if (tracks.length) {
-                    torchTrack = tracks[0];
-                    const caps = torchTrack.getCapabilities ? torchTrack.getCapabilities() : {};
-                    const btn  = document.getElementById('torchBtn');
-                    if (btn) btn.style.display = caps.torch ? 'flex' : 'none';
-                }
+                    if (chip) chip.textContent = '🔍 Scanning…';
+                    scannerInterval = setInterval(runScanTick, 200);
 
-                if (chip) chip.textContent = '🔍 Scanning…';
-
-                // Wait for detector init, then choose scanning method
-                await initDetector();
-                if (_detector) {
-                    // Use native BarcodeDetector (Chrome/Edge)
-                    scannerInterval = setInterval(runScanTick, 200); // 5fps is plenty
-                } else if (window.ZXing) {
-                    // Fallback: ZXing (Safari, Firefox, etc.)
-                    if (chip) chip.textContent = '🔍 Scanning (ZXing)…';
-                    startZxingScanner(video);
-                } else {
-                    // No scanning support at all
+                } catch(err) {
+                    console.warn('Camera error:', err);
                     if (chip) {
-                        chip.style.background = 'rgba(113,128,150,0.9)';
-                        chip.textContent = '⌨️ Camera active — use manual entry';
+                        chip.style.background = 'rgba(229,62,62,0.9)';
+                        chip.textContent = '📵 No camera — use manual entry';
                     }
                 }
 
-            } catch(err) {
-                console.warn('Camera error:', err);
+            } else if (window.ZXing) {
+                // ── ZXing path (Safari / iOS / Firefox) ──
+                // ZXing must own the stream — do NOT call getUserMedia first
+                if (chip) chip.textContent = '⏳ Starting camera…';
+                startZxingScanner(video, chip);
+
+            } else {
+                // ── No scanning support ──
                 if (chip) {
-                    chip.style.background = 'rgba(229,62,62,0.9)';
-                    chip.textContent = '📵 No camera — use manual entry';
+                    chip.style.background = 'rgba(113,128,150,0.9)';
+                    chip.textContent = '⌨️ Use manual entry below';
                 }
             }
         }
