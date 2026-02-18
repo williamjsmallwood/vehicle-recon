@@ -7579,20 +7579,29 @@ Assign a workflow when the vehicle arrives.`);
         }
 
         function tryCode128(runs) {
-            // Estimate module width from the SMALLEST runs in the entire row
-            // (the narrowest bars/spaces = 1 module wide)
-            const allW = runs.map(r => r[1]);
-            allW.sort((a,b) => a-b);
-            // Use 15th percentile of all run widths as the 1-module estimate
-            const mod = allW[Math.floor(allW.length * 0.15)] || 1;
+            // ── Module width estimation ──────────────────────────────────────────
+            // Build a histogram of run widths and find the dominant small-run peak.
+            // This is far more reliable than a flat percentile because quiet zones
+            // create a large cluster of wide runs that skew percentile estimates.
+            const hist = {};
+            for (const r of runs) { hist[r[1]] = (hist[r[1]] || 0) + 1; }
+            // Find the most-common width among runs ≤ median width
+            const allW = runs.map(r => r[1]).sort((a,b) => a-b);
+            const medW = allW[Math.floor(allW.length * 0.5)] || 1;
+            let bestCount = 0, bestW = 1;
+            for (const [w, cnt] of Object.entries(hist)) {
+                const wn = Number(w);
+                if (wn <= medW && cnt > bestCount) { bestCount = cnt; bestW = wn; }
+            }
+            const mod = bestW || 1;
 
-            // Scan for start character
+            // ── Start-symbol scan ────────────────────────────────────────────────
             for (let ri = 0; ri + 5 < runs.length; ri++) {
                 if (!runs[ri][0]) continue; // must start on dark bar
 
                 const sv = matchSym(runs, ri, mod);
                 let charset;
-                if (sv === 103) charset = "A";
+                if      (sv === 103) charset = "A";
                 else if (sv === 104) charset = "B";
                 else if (sv === 105) charset = "C";
                 else continue;
@@ -7601,10 +7610,27 @@ Assign a workflow when the vehicle arrives.`);
                 const chars = [];
                 let valid = false;
 
+                // Code-128 stop symbol = 7 elements [2,3,3,1,1,1,2] + 13 modules
+                // We treat it specially: after matching the 6-element table value 106
+                // (which is the "pre-stop" portion), the 7th element is a trailing bar.
+                // Strategy: accept val===106 OR detect a 13-module stop pattern directly.
                 while (pos + 5 < runs.length) {
                     const val = matchSym(runs, pos, mod);
+
+                    // Check for stop symbol: 7-element [2,3,3,1,1,1,2] = 13 modules
+                    if (pos + 6 < runs.length && runs[pos][0]) {
+                        const st = runs[pos][1]+runs[pos+1][1]+runs[pos+2][1]+runs[pos+3][1]+runs[pos+4][1]+runs[pos+5][1]+runs[pos+6][1];
+                        const sm = st / 13.0;
+                        const sp = [2,3,3,1,1,1,2];
+                        let stopOk = true;
+                        for (let k = 0; k < 7; k++) {
+                            if (Math.abs(runs[pos+k][1]/sm - sp[k]) > 0.75) { stopOk = false; break; }
+                        }
+                        if (stopOk) { valid = true; break; }
+                    }
+
                     if (val < 0) break;
-                    if (val === 106) { valid = true; break; }
+                    if (val === 106) { valid = true; break; }   // stop (6-elem match fallback)
                     if (val === 99)  { charset = "C"; pos += 6; continue; }
                     if (val === 100) { charset = "B"; pos += 6; continue; }
                     if (val === 101) { charset = "A"; pos += 6; continue; }
@@ -7613,32 +7639,34 @@ Assign a workflow when the vehicle arrives.`);
                     pos += 6;
                 }
 
-                if (valid && chars.length >= 4) {
-                    const result = chars.join("").replace(/[^A-Za-z0-9]/g, "");
-                    if (result.length >= 6) return result;
-                }
+                // Accept even without a clean stop if we decoded a plausible VIN
+                const result = chars.join("").replace(/[^A-Za-z0-9]/g, "");
+                if (result.length >= 6 && (valid || chars.length >= 10)) return result;
             }
             return null;
         }
 
         function matchSym(runs, ri, mod) {
             if (ri + 5 >= runs.length) return -1;
-            // Use this symbol's own total to refine mod estimate
+            // Use this symbol's own total to refine mod estimate (each symbol = 11 modules)
             const symTotal = runs[ri][1]+runs[ri+1][1]+runs[ri+2][1]+runs[ri+3][1]+runs[ri+4][1]+runs[ri+5][1];
             const symMod = symTotal / 11.0;
-            // Use whichever mod estimate gives a cleaner fit
-            for (const m of [symMod, mod, (symMod+mod)/2]) {
+            // Try several mod estimates; track best (lowest-error) match across all
+            let bestVal = -1, bestErr = 0.75; // tolerance per element in modules
+            for (const m of [symMod, mod, (symMod + mod) / 2]) {
                 if (m < 0.5) continue;
                 for (let i = 0; i < C128_TABLE.length; i++) {
                     const p = C128_TABLE[i];
-                    let ok = true;
+                    let maxErr = 0;
                     for (let k = 0; k < 6; k++) {
-                        if (Math.abs(runs[ri+k][1]/m - p[k]) > 0.7) { ok = false; break; }
+                        const e = Math.abs(runs[ri+k][1] / m - p[k]);
+                        if (e > maxErr) maxErr = e;
+                        if (maxErr >= bestErr) break;
                     }
-                    if (ok) return i;
+                    if (maxErr < bestErr) { bestErr = maxErr; bestVal = i; }
                 }
             }
-            return -1;
+            return bestVal;
         }
 
         function valToChar(val, charset) {
