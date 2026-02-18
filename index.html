@@ -7505,6 +7505,31 @@ Assign a workflow when the vehicle arrives.`);
         let _torchTrack   = null;
 
         // ── Barcode decoder ───────────────────────────────────────────────────
+        // ── Debug helper — shows what the decoder actually sees ───────────────
+        function getDecodeDebugInfo(imageData) {
+            const { data, width, height } = imageData;
+            const y = Math.floor(height * 0.5);
+            const lum = new Uint8Array(width);
+            let sum = 0;
+            for (let x = 0; x < width; x++) {
+                const i = (y * width + x) * 4;
+                lum[x] = (data[i]*77 + data[i+1]*150 + data[i+2]*29) >> 8;
+                sum += lum[x];
+            }
+            const mean = sum / width;
+            // Count dark/light transitions
+            let transitions = 0;
+            let darkRuns = 0;
+            const thresh = mean * 0.85;
+            let prev = lum[0] < thresh;
+            for (let x = 1; x < width; x++) {
+                const d = lum[x] < thresh;
+                if (d !== prev) { transitions++; if (d) darkRuns++; }
+                prev = d;
+            }
+            return "runs:" + darkRuns + " trans:" + transitions + " lum:" + Math.round(mean);
+        }
+
         // ── Barcode decoder (ratio-based Code-128) ─────────────────────────
         // Uses edge ratios instead of integer rounding — handles real camera images
         // where bars are never perfectly sharp. This is how production scanners work.
@@ -7754,6 +7779,7 @@ Assign a workflow when the vehicle arrives.`);
                     if (caps.torch) { const b = document.getElementById("torchBtn"); if (b) b.style.display = "flex"; }
                 }
                 if (chip) chip.textContent = "🔍 Scanning…";
+                let _dbgTick = 0;
                 _scanInterval = setInterval(function() {
                     if (!scannerActive) return;
                     if (video.readyState < 2 || video.videoWidth === 0) return;
@@ -7767,7 +7793,16 @@ Assign a workflow when the vehicle arrives.`);
                     ctx.drawImage(video, 0, 0, w, h);
                     const imgData = ctx.getImageData(0, 0, w, h);
                     const result = decodeBarcodeFromImageData(imgData);
-                    if (result && result.length >= 4) handleScanResult(result);
+                    if (result && result.length >= 4) {
+                        handleScanResult(result);
+                    } else {
+                        // Show debug info every 10 ticks (~2s)
+                        _dbgTick++;
+                        if (_dbgTick % 10 === 0 && chip) {
+                            const dbg = getDecodeDebugInfo(imgData);
+                            chip.textContent = dbg;
+                        }
+                    }
                 }, 200);
             } catch(err) {
                 console.warn("Camera error:", err);
