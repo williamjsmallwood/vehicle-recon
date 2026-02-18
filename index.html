@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Vehicle Recon Management System</title>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.js"></script>
     <style>
         * {
             margin: 0;
@@ -7502,7 +7501,6 @@ Assign a workflow when the vehicle arrives.`);
         let scannerActive = false;
         let torchOn       = false;
         let _scanStream   = null;
-        let _sharedStream = null;
         let _scanInterval = null;
         let _torchTrack   = null;
 
@@ -7541,16 +7539,11 @@ Assign a workflow when the vehicle arrives.`);
         const C128_TABLE = [[2,1,2,2,2,2],[2,2,2,1,2,2],[2,2,2,2,2,1],[1,2,1,2,2,3],[1,2,1,3,2,2],[1,3,1,2,2,2],[1,2,2,2,1,3],[1,2,2,3,1,2],[1,3,2,2,1,2],[2,2,1,2,1,3],[2,2,1,3,1,2],[2,3,1,2,1,2],[1,1,2,2,3,2],[1,2,2,1,3,2],[1,2,2,2,3,1],[1,1,3,2,2,2],[1,2,3,1,2,2],[1,2,3,2,2,1],[2,2,3,2,1,1],[2,2,1,1,3,2],[2,2,1,2,3,1],[2,1,3,2,1,2],[2,2,3,1,1,2],[3,1,2,1,3,1],[3,1,1,2,2,2],[3,2,1,1,2,2],[3,2,1,2,2,1],[3,1,2,2,1,2],[3,2,2,1,1,2],[3,2,2,2,1,1],[2,1,2,1,2,3],[2,1,2,3,2,1],[2,3,2,1,2,1],[1,1,1,3,2,3],[1,3,1,1,2,3],[1,3,1,3,2,1],[1,1,2,3,1,3],[1,3,2,1,1,3],[1,3,2,3,1,1],[2,1,1,3,1,3],[2,3,1,1,1,3],[2,3,1,3,1,1],[1,1,2,1,3,3],[1,1,2,3,3,1],[1,3,2,1,3,1],[1,1,3,1,2,3],[1,1,3,3,2,1],[1,3,3,1,2,1],[3,1,3,1,2,1],[2,1,1,3,3,1],[2,3,1,1,3,1],[2,1,3,1,1,3],[2,1,3,3,1,1],[2,1,3,1,3,1],[3,1,1,1,2,3],[3,1,1,3,2,1],[3,3,1,1,2,1],[3,1,2,1,1,3],[3,1,2,3,1,1],[3,3,2,1,1,1],[3,1,4,1,1,1],[2,2,1,4,1,1],[4,3,1,1,1,1],[1,1,1,2,2,4],[1,1,1,4,2,2],[1,2,1,1,2,4],[1,2,1,4,2,1],[1,4,1,1,2,2],[1,4,1,2,2,1],[1,1,2,2,1,4],[1,1,2,4,1,2],[1,2,2,1,1,4],[1,2,2,4,1,1],[1,4,2,1,1,2],[1,4,2,2,1,1],[2,4,1,2,1,1],[2,2,1,1,1,4],[4,1,3,1,1,1],[2,4,1,1,1,2],[1,3,4,1,1,1],[1,1,1,2,4,2],[1,2,1,1,4,2],[1,2,1,2,4,1],[1,1,4,2,1,2],[1,2,4,1,1,2],[1,2,4,2,1,1],[4,1,1,2,1,2],[4,2,1,1,1,2],[4,2,1,2,1,1],[2,1,2,1,4,1],[2,1,4,1,2,1],[4,1,2,1,2,1],[1,1,1,1,4,3],[1,1,1,3,4,1],[1,3,1,1,4,1],[1,1,4,1,1,3],[1,1,4,3,1,1],[4,1,1,1,1,3],[4,1,1,3,1,1],[1,1,3,1,4,1],[1,1,4,1,3,1],[3,1,1,1,4,1],[4,1,1,1,3,1],[2,1,1,4,1,2],[2,1,1,2,1,4],[2,1,1,2,3,2],[2,3,3,1,1,1]];
 
         function decodeBarcodeFromImageData(imageData) {
-            // QR codes via jsQR (loaded from cdnjs)
-            if (typeof jsQR === "function") {
-                const qr = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: "dontInvert" });
-                if (qr && qr.data && qr.data.length >= 4) return qr.data;
-            }
-            // 1D barcodes: scan multiple horizontal rows at different heights
             const { data, width, height } = imageData;
             const fractions = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65];
             for (const rf of fractions) {
                 const y = Math.floor(height * rf);
+                // Build luminance row
                 const lum = new Uint8Array(width);
                 let sum = 0;
                 for (let x = 0; x < width; x++) {
@@ -7559,15 +7552,15 @@ Assign a workflow when the vehicle arrives.`);
                     sum += lum[x];
                 }
                 const mean = sum / width;
+                // Try several thresholds
                 for (const tm of [0.75, 0.70, 0.80, 0.65, 0.85]) {
                     const thresh = mean * tm;
                     const runs = buildRuns(lum, width, thresh);
-                    // Code 39 handles both orientations internally
-                    const c39 = tryCode39(runs);
-                    if (c39) return c39;
-                    // Code 128 needs explicit forward + reverse
-                    const c128 = tryCode128(runs) || tryCode128(runs.slice().reverse());
-                    if (c128) return c128;
+                    const fwd = tryCode128(runs);
+                    if (fwd) return fwd;
+                    // Reverse
+                    const rev = tryCode128(runs.slice().reverse());
+                    if (rev) return rev;
                 }
             }
             return null;
@@ -7585,100 +7578,21 @@ Assign a workflow when the vehicle arrives.`);
             return runs;
         }
 
-        // ── Code 39 ──────────────────────────────────────────────────────────────
-        // 9 elements per char (5 bars + 4 spaces). Bars/spaces are narrow or wide.
-        // Start/stop = '*'. Handles both barcode orientations via reverse table.
-
-        const C39 = (function() {
-            const fwd = {
-                "000110100":"0","100100001":"1","001100001":"2","101100000":"3",
-                "000110001":"4","100110000":"5","001110000":"6","000100101":"7",
-                "100100100":"8","001100100":"9","100001001":"A","001001001":"B",
-                "101001000":"C","000011001":"D","100011000":"E","001011000":"F",
-                "000001101":"G","100001100":"H","001001100":"I","000011100":"J",
-                "100000011":"K","001000011":"L","101000010":"M","000010011":"N",
-                "100010010":"O","001010010":"P","000000111":"Q","100000110":"R",
-                "001000110":"S","000010110":"T","110000001":"U","011000001":"V",
-                "111000000":"W","010010001":"X","110010000":"Y","011010000":"Z",
-                "010000101":"-","110000100":".","011000100":" ","010101000":"$",
-                "010100010":"/","010001010":"+","000101010":"%","010010100":"*"
-            };
-            const rev = {};
-            for (const [b, c] of Object.entries(fwd)) rev[b.split("").reverse().join("")] = c;
-            return { fwd, rev };
-        })();
-
-        function tryCode39(runs) {
-            // Find narrow/wide threshold via the bimodal gap in bar widths.
-            // More reliable than narrow*ratio at small module sizes.
-            const barW = runs.filter(r => r[0]).map(r => r[1]).sort((a, b) => a - b);
-            if (barW.length < 6) return null;
-            let maxGap = 0, wideThresh = barW[Math.floor(barW.length * 0.3)] * 2;
-            for (let i = 1; i < barW.length; i++) {
-                if (barW[i] - barW[i-1] > maxGap) {
-                    maxGap = barW[i] - barW[i-1];
-                    wideThresh = (barW[i-1] + barW[i]) / 2;
-                }
-            }
-
-            for (const [table, isReversed] of [[C39.fwd, false], [C39.rev, true]]) {
-                for (let ri = 0; ri + 8 < runs.length; ri++) {
-                    if (!runs[ri][0]) continue;                   // must start on dark bar
-                    if (c39Sym(runs, ri, wideThresh, table) !== "*") continue;
-
-                    const chars = [];
-                    let pos = ri + 9;
-                    while (pos < runs.length && !runs[pos][0]) pos++; // skip inter-char gap
-
-                    while (pos + 8 < runs.length) {
-                        if (!runs[pos][0]) { pos++; continue; }
-                        const ch = c39Sym(runs, pos, wideThresh, table);
-                        if (ch === null) break;
-                        if (ch === "*") {
-                            if (isReversed) chars.reverse();
-                            const s = chars.join("").replace(/[^A-Za-z0-9]/g, "");
-                            if (s.length >= 6) return s;
-                            break;
-                        }
-                        chars.push(ch);
-                        pos += 9;
-                        while (pos < runs.length && !runs[pos][0]) pos++;
-                    }
-                }
-            }
-            return null;
-        }
-
-        function c39Sym(runs, ri, wideThresh, table) {
-            if (ri + 8 >= runs.length || !runs[ri][0]) return null; // must start on dark bar
-            let bits = "";
-            for (let k = 0; k < 9; k++) {
-                if (ri + k >= runs.length) return null;
-                bits += runs[ri + k][1] >= wideThresh ? "1" : "0";
-            }
-            return table[bits] !== undefined ? table[bits] : null;
-        }
-
-        // ── Code 128 ─────────────────────────────────────────────────────────────
-        // 6 elements per char. Module widths 1-4. Start/stop detected by pattern.
-
         function tryCode128(runs) {
-            // Module width: most-frequent run width in the smaller half of widths
-            const hist = {};
-            for (const r of runs) hist[r[1]] = (hist[r[1]] || 0) + 1;
-            const allW = runs.map(r => r[1]).sort((a, b) => a - b);
-            const medW = allW[Math.floor(allW.length * 0.5)] || 1;
-            let bestCnt = 0, mod = 1;
-            for (const [w, cnt] of Object.entries(hist)) {
-                const wn = +w;
-                if (wn <= medW && cnt > bestCnt) { bestCnt = cnt; mod = wn; }
-            }
+            // Estimate module width from the SMALLEST runs in the entire row
+            // (the narrowest bars/spaces = 1 module wide)
+            const allW = runs.map(r => r[1]);
+            allW.sort((a,b) => a-b);
+            // Use 15th percentile of all run widths as the 1-module estimate
+            const mod = allW[Math.floor(allW.length * 0.15)] || 1;
 
+            // Scan for start character
             for (let ri = 0; ri + 5 < runs.length; ri++) {
-                if (!runs[ri][0]) continue;
-                const sv = c128Sym(runs, ri, mod);
+                if (!runs[ri][0]) continue; // must start on dark bar
+
+                const sv = matchSym(runs, ri, mod);
                 let charset;
-                if      (sv === 103) charset = "A";
+                if (sv === 103) charset = "A";
                 else if (sv === 104) charset = "B";
                 else if (sv === 105) charset = "C";
                 else continue;
@@ -7688,60 +7602,46 @@ Assign a workflow when the vehicle arrives.`);
                 let valid = false;
 
                 while (pos + 5 < runs.length) {
-                    // Check 7-element stop pattern BEFORE decoding as data
-                    if (pos + 6 < runs.length && runs[pos][0]) {
-                        const stopTotal = runs[pos][1]+runs[pos+1][1]+runs[pos+2][1]+
-                                          runs[pos+3][1]+runs[pos+4][1]+runs[pos+5][1]+runs[pos+6][1];
-                        const sm = stopTotal / 13;
-                        const sp = [2,3,3,1,1,1,2];
-                        let isStop = true;
-                        for (let k = 0; k < 7; k++) {
-                            if (Math.abs(runs[pos+k][1]/sm - sp[k]) > 0.75) { isStop = false; break; }
-                        }
-                        if (isStop) { valid = true; break; }
-                    }
-                    const val = c128Sym(runs, pos, mod);
+                    const val = matchSym(runs, pos, mod);
                     if (val < 0) break;
                     if (val === 106) { valid = true; break; }
                     if (val === 99)  { charset = "C"; pos += 6; continue; }
                     if (val === 100) { charset = "B"; pos += 6; continue; }
                     if (val === 101) { charset = "A"; pos += 6; continue; }
                     if (val === 102 || val === 97 || val === 96) { pos += 6; continue; }
-                    chars.push(c128Char(val, charset));
+                    chars.push(valToChar(val, charset));
                     pos += 6;
                 }
 
-                // Last symbol before stop is the checksum — strip it
-                if (chars.length > 0) chars.pop();
-                const result = chars.join("").replace(/[^A-Za-z0-9]/g, "");
-                if (valid && result.length >= 6) return result;
+                if (valid && chars.length >= 4) {
+                    const result = chars.join("").replace(/[^A-Za-z0-9]/g, "");
+                    if (result.length >= 6) return result;
+                }
             }
             return null;
         }
 
-        function c128Sym(runs, ri, mod) {
+        function matchSym(runs, ri, mod) {
             if (ri + 5 >= runs.length) return -1;
-            const symTotal = runs[ri][1]+runs[ri+1][1]+runs[ri+2][1]+
-                             runs[ri+3][1]+runs[ri+4][1]+runs[ri+5][1];
-            const symMod = symTotal / 11;
-            let bestVal = -1, bestErr = 0.75;
-            for (const m of [symMod, mod, (symMod + mod) / 2]) {
+            // Use this symbol's own total to refine mod estimate
+            const symTotal = runs[ri][1]+runs[ri+1][1]+runs[ri+2][1]+runs[ri+3][1]+runs[ri+4][1]+runs[ri+5][1];
+            const symMod = symTotal / 11.0;
+            // Use whichever mod estimate gives a cleaner fit
+            for (const m of [symMod, mod, (symMod+mod)/2]) {
                 if (m < 0.5) continue;
                 for (let i = 0; i < C128_TABLE.length; i++) {
                     const p = C128_TABLE[i];
-                    let maxErr = 0;
+                    let ok = true;
                     for (let k = 0; k < 6; k++) {
-                        const e = Math.abs(runs[ri+k][1] / m - p[k]);
-                        if (e > maxErr) maxErr = e;
-                        if (maxErr >= bestErr) break;
+                        if (Math.abs(runs[ri+k][1]/m - p[k]) > 0.7) { ok = false; break; }
                     }
-                    if (maxErr < bestErr) { bestErr = maxErr; bestVal = i; }
+                    if (ok) return i;
                 }
             }
-            return bestVal;
+            return -1;
         }
 
-        function c128Char(val, charset) {
+        function valToChar(val, charset) {
             if (charset === "C") return String(val).padStart(2, "0");
             if (charset === "B" && val <= 94) return String.fromCharCode(val + 32);
             if (charset === "A") {
@@ -7794,6 +7694,8 @@ Assign a workflow when the vehicle arrives.`);
                     '<video id="vinScannerVideo" autoplay playsinline muted></video>',
                     '<canvas id="vinScanCanvas" style="display:none;"></canvas>',
                     '<div id="scanBeamLine"></div>',
+                    '<div style="position:absolute;left:5%;right:5%;top:38%;height:24%;border:2px solid rgba(99,179,237,0.85);border-radius:4px;pointer-events:none;z-index:15;box-shadow:0 0 0 9999px rgba(0,0,0,0.35);"></div>',
+                    '<div style="position:absolute;left:50%;top:38%;transform:translateX(-50%);margin-top:-18px;background:rgba(0,0,0,0.55);color:#90cdf4;font-size:10px;font-weight:700;padding:2px 10px;border-radius:10px;white-space:nowrap;z-index:16;pointer-events:none;">Align barcode inside box</div>',
                     '<div id="scanChip" style="position:absolute;top:10px;left:50%;transform:translateX(-50%);background:rgba(66,153,225,.92);color:white;padding:5px 16px;border-radius:20px;font-size:12px;font-weight:700;white-space:nowrap;z-index:20;">⏳ Starting camera…</div>',
                     '<div style="position:absolute;bottom:8px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.6);color:#a0aec0;padding:3px 12px;border-radius:20px;font-size:10px;font-weight:600;white-space:nowrap;z-index:20;">' + cacheLabel + '</div>',
                   '</div>',
@@ -7816,15 +7718,10 @@ Assign a workflow when the vehicle arrives.`);
             const video = document.getElementById("vinScannerVideo");
             const chip  = document.getElementById("scanChip");
             try {
-                if (_sharedStream && _sharedStream.active) {
-                    _scanStream = _sharedStream;
-                } else {
-                    _scanStream = await navigator.mediaDevices.getUserMedia({
-                        video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
-                        audio: false
-                    });
-                    _sharedStream = _scanStream;
-                }
+                _scanStream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+                    audio: false
+                });
                 video.srcObject = _scanStream;
                 await video.play();
                 const tracks = _scanStream.getVideoTracks();
@@ -7870,7 +7767,7 @@ Assign a workflow when the vehicle arrives.`);
                             chip.textContent = dbg;
                         }
                     }
-                }, 200);
+                }, 100);
             } catch(err) {
                 console.warn("Camera error:", err);
                 if (chip) { chip.style.background = "rgba(229,62,62,.9)"; chip.textContent = "📵 Camera error — use manual entry"; }
@@ -7892,9 +7789,12 @@ Assign a workflow when the vehicle arrives.`);
             scannerActive = false;
             clearInterval(_scanInterval); _scanInterval = null;
             if (torchOn && _torchTrack) { try { _torchTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch(e) {} torchOn = false; }
-            _scanStream = null;
+            if (_scanStream) { _scanStream.getTracks().forEach(function(t){ t.stop(); }); _scanStream = null; }
             const chip = document.getElementById("scanChip");
-            const cleaned = raw.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+            let cleaned = raw.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+            // OEM window stickers often prefix VIN data with 'I' as a label identifier.
+            // Strip it when the result is one char longer than a standard 17-char VIN.
+            if (cleaned.length === 18 && cleaned.charAt(0) === 'I') cleaned = cleaned.slice(1);
             const hit = lookupInCache(cleaned);
             if (chip) { chip.style.background = hit ? "rgba(72,187,120,.95)" : "rgba(229,62,62,.92)"; chip.textContent = hit ? "✅ Found!" : "🚫 Not in recon"; }
             playScanBeep(!!hit);
@@ -7906,7 +7806,7 @@ Assign a workflow when the vehicle arrives.`);
             scannerActive = false;
             clearInterval(_scanInterval); _scanInterval = null;
             if (torchOn && _torchTrack) { try { _torchTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch(e) {} torchOn = false; }
-            _scanStream = null;
+            if (_scanStream) { _scanStream.getTracks().forEach(function(t){ t.stop(); }); _scanStream = null; }
             const m = document.getElementById("vinScannerModal");
             if (m) m.remove();
         }
