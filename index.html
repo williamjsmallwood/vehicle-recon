@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Vehicle Recon Management System</title>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.js"></script>
     <style>
         * {
             margin: 0;
@@ -7500,7 +7501,8 @@ Assign a workflow when the vehicle arrives.`);
 
         let scannerActive = false;
         let torchOn       = false;
-        let _scanStream   = null;
+        let _scanStream   = null;   // active scanning stream (closed on scan result)
+        let _sharedStream = null;   // kept alive between scans to avoid re-prompting
         let _scanInterval = null;
         let _torchTrack   = null;
 
@@ -7539,6 +7541,11 @@ Assign a workflow when the vehicle arrives.`);
         const C128_TABLE = [[2,1,2,2,2,2],[2,2,2,1,2,2],[2,2,2,2,2,1],[1,2,1,2,2,3],[1,2,1,3,2,2],[1,3,1,2,2,2],[1,2,2,2,1,3],[1,2,2,3,1,2],[1,3,2,2,1,2],[2,2,1,2,1,3],[2,2,1,3,1,2],[2,3,1,2,1,2],[1,1,2,2,3,2],[1,2,2,1,3,2],[1,2,2,2,3,1],[1,1,3,2,2,2],[1,2,3,1,2,2],[1,2,3,2,2,1],[2,2,3,2,1,1],[2,2,1,1,3,2],[2,2,1,2,3,1],[2,1,3,2,1,2],[2,2,3,1,1,2],[3,1,2,1,3,1],[3,1,1,2,2,2],[3,2,1,1,2,2],[3,2,1,2,2,1],[3,1,2,2,1,2],[3,2,2,1,1,2],[3,2,2,2,1,1],[2,1,2,1,2,3],[2,1,2,3,2,1],[2,3,2,1,2,1],[1,1,1,3,2,3],[1,3,1,1,2,3],[1,3,1,3,2,1],[1,1,2,3,1,3],[1,3,2,1,1,3],[1,3,2,3,1,1],[2,1,1,3,1,3],[2,3,1,1,1,3],[2,3,1,3,1,1],[1,1,2,1,3,3],[1,1,2,3,3,1],[1,3,2,1,3,1],[1,1,3,1,2,3],[1,1,3,3,2,1],[1,3,3,1,2,1],[3,1,3,1,2,1],[2,1,1,3,3,1],[2,3,1,1,3,1],[2,1,3,1,1,3],[2,1,3,3,1,1],[2,1,3,1,3,1],[3,1,1,1,2,3],[3,1,1,3,2,1],[3,3,1,1,2,1],[3,1,2,1,1,3],[3,1,2,3,1,1],[3,3,2,1,1,1],[3,1,4,1,1,1],[2,2,1,4,1,1],[4,3,1,1,1,1],[1,1,1,2,2,4],[1,1,1,4,2,2],[1,2,1,1,2,4],[1,2,1,4,2,1],[1,4,1,1,2,2],[1,4,1,2,2,1],[1,1,2,2,1,4],[1,1,2,4,1,2],[1,2,2,1,1,4],[1,2,2,4,1,1],[1,4,2,1,1,2],[1,4,2,2,1,1],[2,4,1,2,1,1],[2,2,1,1,1,4],[4,1,3,1,1,1],[2,4,1,1,1,2],[1,3,4,1,1,1],[1,1,1,2,4,2],[1,2,1,1,4,2],[1,2,1,2,4,1],[1,1,4,2,1,2],[1,2,4,1,1,2],[1,2,4,2,1,1],[4,1,1,2,1,2],[4,2,1,1,1,2],[4,2,1,2,1,1],[2,1,2,1,4,1],[2,1,4,1,2,1],[4,1,2,1,2,1],[1,1,1,1,4,3],[1,1,1,3,4,1],[1,3,1,1,4,1],[1,1,4,1,1,3],[1,1,4,3,1,1],[4,1,1,1,1,3],[4,1,1,3,1,1],[1,1,3,1,4,1],[1,1,4,1,3,1],[3,1,1,1,4,1],[4,1,1,1,3,1],[2,1,1,4,1,2],[2,1,1,2,1,4],[2,1,1,2,3,2],[2,3,3,1,1,1]];
 
         function decodeBarcodeFromImageData(imageData) {
+            // QR code via jsQR (loaded async in scanner CSS injection)
+            if (typeof jsQR === "function") {
+                const qr = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: "dontInvert" });
+                if (qr && qr.data && qr.data.length >= 4) return qr.data;
+            }
             const { data, width, height } = imageData;
             const fractions = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65];
             for (const rf of fractions) {
@@ -7554,16 +7561,14 @@ Assign a workflow when the vehicle arrives.`);
                 for (const tm of [0.75, 0.70, 0.80, 0.65, 0.85]) {
                     const thresh = mean * tm;
                     const runs = buildRuns(lum, width, thresh);
-                    // Try Code 39 first — most OEM VIN stickers use it
-                    const c39f = tryCode39(runs);
-                    if (c39f) return c39f;
-                    const c39r = tryCode39(runs.slice().reverse());
-                    if (c39r) return c39r;
-                    // Fall back to Code 128
-                    const fwd = tryCode128(runs);
-                    if (fwd) return fwd;
-                    const rev = tryCode128(runs.slice().reverse());
-                    if (rev) return rev;
+                    // tryCode39 handles both orientations internally
+                    const c39 = tryCode39(runs);
+                    if (c39) return c39;
+                    // Code 128 needs explicit reversal
+                    const c128f = tryCode128(runs);
+                    if (c128f) return c128f;
+                    const c128r = tryCode128(runs.slice().reverse());
+                    if (c128r) return c128r;
                 }
             }
             return null;
@@ -7609,33 +7614,41 @@ Assign a workflow when the vehicle arrives.`);
         })();
 
         function tryCode39(runs) {
-            const allW = runs.map(r => r[1]).sort((a,b) => a-b);
-            const narrow = allW[Math.floor(allW.length * 0.15)] || 1;
-            const wideThresh = narrow * 1.8;
+            // Find the narrow/wide threshold using the bimodal gap in bar widths.
+            // This is robust at small module sizes where narrow*1.8 breaks down.
+            const barW = runs.filter(r => r[0]).map(r => r[1]).sort((a,b) => a-b);
+            if (barW.length < 4) return null;
+            let maxGap = 0, wideThresh = barW[0] * 2;
+            for (let i = 1; i < barW.length; i++) {
+                const gap = barW[i] - barW[i-1];
+                if (gap > maxGap) { maxGap = gap; wideThresh = (barW[i-1] + barW[i]) / 2; }
+            }
 
-            // Try both forward and reverse tables (handles upside-down barcodes)
             for (const [table, reversed] of [[C39_TABLE.fwd, false], [C39_TABLE.rev, true]]) {
                 for (let ri = 0; ri + 8 < runs.length; ri++) {
-                    if (!runs[ri][0]) continue;
+                    if (!runs[ri][0]) continue; // must be a dark bar
 
                     const sym = _c39sym(runs, ri, wideThresh, table);
                     if (sym !== "*") continue;
 
                     const chars = [];
-                    let pos = ri + 9 + 1; // 9 symbol elements + 1 inter-char gap
+                    // Skip past the 9 symbol elements then past any inter-char gap
+                    let pos = ri + 9;
+                    while (pos < runs.length && !runs[pos][0]) pos++;
 
                     while (pos + 8 < runs.length) {
+                        if (!runs[pos][0]) { pos++; continue; } // skip stray light run
                         const c = _c39sym(runs, pos, wideThresh, table);
                         if (c === null) break;
                         if (c === "*") {
-                            // Rev table scans a reversed barcode so chars come out backwards
                             if (reversed) chars.reverse();
                             const result = chars.join("").replace(/[^A-Za-z0-9]/g, "");
                             if (result.length >= 6) return result;
                             break;
                         }
                         chars.push(c);
-                        pos += 9 + 1;
+                        pos += 9;
+                        while (pos < runs.length && !runs[pos][0]) pos++;
                     }
                 }
             }
@@ -7643,7 +7656,8 @@ Assign a workflow when the vehicle arrives.`);
         }
 
         function _c39sym(runs, ri, wideThresh, table) {
-            if (ri + 8 >= runs.length) return null;
+            // Every Code 39 symbol starts with a dark bar — reject misaligned reads
+            if (ri + 8 >= runs.length || !runs[ri][0]) return null;
             let bits = "";
             for (let k = 0; k < 9; k++) {
                 if (ri + k >= runs.length) return null;
@@ -7809,10 +7823,16 @@ Assign a workflow when the vehicle arrives.`);
             const video = document.getElementById("vinScannerVideo");
             const chip  = document.getElementById("scanChip");
             try {
-                _scanStream = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
-                    audio: false
-                });
+                // Reuse an existing stream if available to avoid re-prompting for permission
+                if (_sharedStream && _sharedStream.active) {
+                    _scanStream = _sharedStream;
+                } else {
+                    _scanStream = await navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+                        audio: false
+                    });
+                    _sharedStream = _scanStream;
+                }
                 video.srcObject = _scanStream;
                 await video.play();
                 const tracks = _scanStream.getVideoTracks();
@@ -7880,7 +7900,7 @@ Assign a workflow when the vehicle arrives.`);
             scannerActive = false;
             clearInterval(_scanInterval); _scanInterval = null;
             if (torchOn && _torchTrack) { try { _torchTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch(e) {} torchOn = false; }
-            if (_scanStream) { _scanStream.getTracks().forEach(function(t){ t.stop(); }); _scanStream = null; }
+            _scanStream = null; // release reference but keep _sharedStream alive for next scan
             const chip = document.getElementById("scanChip");
             const cleaned = raw.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
             const hit = lookupInCache(cleaned);
@@ -7894,7 +7914,7 @@ Assign a workflow when the vehicle arrives.`);
             scannerActive = false;
             clearInterval(_scanInterval); _scanInterval = null;
             if (torchOn && _torchTrack) { try { _torchTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch(e) {} torchOn = false; }
-            if (_scanStream) { _scanStream.getTracks().forEach(function(t){ t.stop(); }); _scanStream = null; }
+            _scanStream = null; // keep _sharedStream alive
             const m = document.getElementById("vinScannerModal");
             if (m) m.remove();
         }
