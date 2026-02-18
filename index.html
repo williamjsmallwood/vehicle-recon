@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Vehicle Recon Management System</title>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/index.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -7625,12 +7626,17 @@ Assign a workflow when the vehicle arrives.`);
             document.head.appendChild(st);
         }
 
+        // ZXing reader instance
+        let _zxingReader = null;
+
         async function startScannerCamera() {
             scannerActive = true;
             torchTrack = null;
             const video = document.getElementById('vinScannerVideo');
             const badge = document.getElementById('scannerStatusBadge');
+
             try {
+                // Request camera stream
                 scannerStream = await navigator.mediaDevices.getUserMedia({
                     video: {
                         facingMode: { ideal: 'environment' },
@@ -7645,14 +7651,98 @@ Assign a workflow when the vehicle arrives.`);
                 const tracks = scannerStream.getVideoTracks();
                 if (tracks.length > 0) {
                     torchTrack = tracks[0];
-                    // Show/hide torch button based on support
                     const caps = torchTrack.getCapabilities ? torchTrack.getCapabilities() : {};
                     const torchBtn = document.getElementById('torchBtn');
                     if (torchBtn) torchBtn.style.display = caps.torch ? 'flex' : 'none';
                 }
 
                 if (badge) badge.textContent = '🔍 Scanning…';
-                requestAnimationFrame(scanFrame);
+
+                // Try native BarcodeDetector first (fastest), fall back to ZXing
+                const nativeDetector = (() => {
+                    if (typeof BarcodeDetector !== 'undefined') {
+                        try {
+                            return new BarcodeDetector({
+                                formats: ['qr_code', 'code_128', 'code_39', 'ean_13', 'itf', 'aztec', 'data_matrix', 'code_93', 'upc_a', 'upc_e']
+                            });
+                        } catch(e) { return null; }
+                    }
+                    return null;
+                })();
+
+                if (nativeDetector) {
+                    console.log('✅ Using native BarcodeDetector');
+                    // Native path — rAF loop
+                    const nativeScanLoop = async () => {
+                        if (!scannerActive) return;
+                        if (video.readyState >= 2) {
+                            try {
+                                const barcodes = await nativeDetector.detect(video);
+                                if (barcodes && barcodes.length > 0) {
+                                    const code = barcodes[0].rawValue;
+                                    if (code && code.trim().length >= 4) {
+                                        handleScanResult(code.trim());
+                                        return;
+                                    }
+                                }
+                            } catch(e) { /* frame not ready */ }
+                        }
+                        if (scannerActive) scannerAnimFrame = requestAnimationFrame(nativeScanLoop);
+                    };
+                    scannerAnimFrame = requestAnimationFrame(nativeScanLoop);
+
+                } else if (typeof ZXingBrowser !== 'undefined') {
+                    // ZXing fallback — continuous decode from video element
+                    console.log('✅ Using ZXing fallback decoder');
+                    const hints = new Map();
+                    const formats = [
+                        ZXingBrowser.BarcodeFormat.QR_CODE,
+                        ZXingBrowser.BarcodeFormat.CODE_128,
+                        ZXingBrowser.BarcodeFormat.CODE_39,
+                        ZXingBrowser.BarcodeFormat.EAN_13,
+                        ZXingBrowser.BarcodeFormat.ITF,
+                        ZXingBrowser.BarcodeFormat.AZTEC,
+                        ZXingBrowser.BarcodeFormat.DATA_MATRIX,
+                        ZXingBrowser.BarcodeFormat.PDF_417
+                    ].filter(Boolean);
+                    if (formats.length) hints.set(ZXingBrowser.DecodeHintType.POSSIBLE_FORMATS, formats);
+                    hints.set(ZXingBrowser.DecodeHintType.TRY_HARDER, true);
+
+                    _zxingReader = new ZXingBrowser.BrowserMultiFormatReader(hints);
+
+                    // Use a canvas to grab frames at 10fps and decode
+                    const canvas = document.createElement('canvas');
+                    const ctx2d  = canvas.getContext('2d');
+
+                    const zxingLoop = async () => {
+                        if (!scannerActive) return;
+                        if (video.readyState >= 2 && video.videoWidth > 0) {
+                            canvas.width  = video.videoWidth;
+                            canvas.height = video.videoHeight;
+                            ctx2d.drawImage(video, 0, 0);
+                            try {
+                                const result = _zxingReader.decodeFromCanvas(canvas);
+                                if (result && result.getText().trim().length >= 4) {
+                                    handleScanResult(result.getText().trim());
+                                    return;
+                                }
+                            } catch(e) {
+                                // NotFoundException is normal (no barcode in frame) — ignore silently
+                            }
+                        }
+                        if (scannerActive) scannerAnimFrame = setTimeout(zxingLoop, 100); // ~10fps
+                    };
+                    zxingLoop();
+
+                } else {
+                    // No barcode library available at all
+                    if (badge) {
+                        badge.style.background = 'rgba(113,128,150,0.9)';
+                        badge.textContent = '⌨️ Use manual entry below';
+                    }
+                    console.warn('No barcode decoder available (BarcodeDetector or ZXing)');
+                }
+
             } catch (err) {
                 console.warn('Camera error:', err);
                 if (badge) {
@@ -7678,50 +7768,9 @@ Assign a workflow when the vehicle arrives.`);
             }
         }
 
-        // BarcodeDetector instance (native browser API)
-        let _barcodeDetector = null;
-        function getBarcodeDetector() {
-            if (_barcodeDetector) return _barcodeDetector;
-            if (typeof BarcodeDetector !== 'undefined') {
-                try {
-                    _barcodeDetector = new BarcodeDetector({
-                        formats: ['qr_code', 'code_128', 'code_39', 'ean_13', 'itf', 'aztec', 'data_matrix']
-                    });
-                } catch(e) { _barcodeDetector = null; }
-            }
-            return _barcodeDetector;
-        }
-
+        // Legacy stub — no longer used directly but kept for safety
         async function scanFrame() {
-            if (!scannerActive) return;
-            const video = document.getElementById('vinScannerVideo');
-            if (!video || video.readyState < 2) {
-                scannerAnimFrame = requestAnimationFrame(scanFrame);
-                return;
-            }
-
-            const detector = getBarcodeDetector();
-            if (detector) {
-                try {
-                    const barcodes = await detector.detect(video);
-                    if (barcodes && barcodes.length > 0) {
-                        const code = barcodes[0].rawValue;
-                        if (code && code.trim().length >= 4) {
-                            handleScanResult(code.trim());
-                            return;
-                        }
-                    }
-                } catch(e) { /* frame not ready */ }
-            } else {
-                // BarcodeDetector not available — nudge to manual
-                const badge = document.getElementById('scannerStatusBadge');
-                if (badge && badge.textContent.includes('Scanning')) {
-                    badge.textContent = '⌨️ Use manual entry below';
-                    badge.style.background = 'rgba(113,128,150,0.9)';
-                }
-            }
-
-            if (scannerActive) scannerAnimFrame = requestAnimationFrame(scanFrame);
+            // No-op: scanning is now handled inside startScannerCamera()
         }
 
         function handleScanResult(raw) {
@@ -7930,7 +7979,14 @@ Assign a workflow when the vehicle arrives.`);
                 torchOn = false;
             }
             if (scannerStream) { scannerStream.getTracks().forEach(t => t.stop()); scannerStream = null; }
+            // Cancel both rAF and setTimeout-based scan loops
             cancelAnimationFrame(scannerAnimFrame);
+            clearTimeout(scannerAnimFrame);
+            // Clean up ZXing reader if active
+            if (_zxingReader) {
+                try { _zxingReader.reset(); } catch(e) {}
+                _zxingReader = null;
+            }
             const modal = document.getElementById('vinScannerModal');
             if (modal) modal.remove();
         }
