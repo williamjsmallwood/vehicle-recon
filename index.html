@@ -7617,7 +7617,7 @@ Assign a workflow when the vehicle arrives.`);
             const total = w0+w1+w2+w3+w4+w5;
             const mod = total / 11.0;
             // Tolerance: ±0.5 modules is generous but catches real camera images
-            const TOL = 0.55;
+            const TOL = 0.65;
             const ws = [w0,w1,w2,w3,w4,w5];
             for (let i = 0; i < C128_TABLE.length; i++) {
                 const pat = C128_TABLE[i];
@@ -7770,6 +7770,10 @@ Assign a workflow when the vehicle arrives.`);
                     _torchTrack = tracks[0];
                     const caps = _torchTrack.getCapabilities ? _torchTrack.getCapabilities() : {};
                     if (caps.torch) { const b = document.getElementById("torchBtn"); if (b) b.style.display = "flex"; }
+                    // Apply 2× zoom if the camera supports it — doubles pixel density on the barcode
+                    if (caps.zoom && caps.zoom.max >= 2) {
+                        try { await _torchTrack.applyConstraints({ advanced: [{ zoom: 2 }] }); } catch(e) {}
+                    }
                 }
                 if (chip) chip.textContent = "🔍 Scanning…";
                 let _dbgTick = 0;
@@ -7778,12 +7782,25 @@ Assign a workflow when the vehicle arrives.`);
                     if (video.readyState < 2 || video.videoWidth === 0) return;
                     const canvas = document.getElementById("vinScanCanvas");
                     if (!canvas) return;
-                    const scale = Math.min(1, 960 / video.videoWidth);
-                    const w = Math.floor(video.videoWidth * scale);
-                    const h = Math.floor(video.videoHeight * scale);
-                    canvas.width = w; canvas.height = h;
+
+                    const vw = video.videoWidth;
+                    const vh = video.videoHeight;
+
+                    // Crop to the center 60% height strip — where the barcode is
+                    // This gives 1.67× more pixels per bar vs using the full frame
+                    const cropY = Math.floor(vh * 0.20);
+                    const cropH = Math.floor(vh * 0.60);
+
+                    // Keep full width but cap at 1280 for performance
+                    const scale = Math.min(1, 1280 / vw);
+                    const w = Math.floor(vw * scale);
+                    const h = Math.floor(cropH * scale);
+
+                    canvas.width  = w;
+                    canvas.height = h;
                     const ctx = canvas.getContext("2d", { willReadFrequently: true });
-                    ctx.drawImage(video, 0, 0, w, h);
+                    // Draw only the cropped strip
+                    ctx.drawImage(video, 0, cropY, vw, cropH, 0, 0, w, h);
                     const imgData = ctx.getImageData(0, 0, w, h);
                     const result = decodeBarcodeFromImageData(imgData);
                     if (result && result.length >= 4) {
