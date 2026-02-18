@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Vehicle Recon Management System</title>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/zxing-wasm@1.3.2/dist/iife/reader/index.js"></script>
     <style>
         * {
             margin: 0;
@@ -7495,10 +7495,33 @@ Assign a workflow when the vehicle arrives.`);
             } catch(e) {}
         }
 
-        // ---- Scanner state ----
-        let scannerActive = false;
-        let torchOn       = false;
-        let _h5scanner    = null;
+        // ==================== VIN SCANNER (zxing-wasm + canvas) ====================
+        // Works on iOS Safari, Android, Chrome, Firefox — WASM runs everywhere
+
+        let scannerActive  = false;
+        let torchOn        = false;
+        let _scanStream    = null;   // MediaStream
+        let _scanInterval  = null;   // setInterval handle
+        let _torchTrack    = null;   // video track for torch
+        let _zxReady       = false;  // zxing-wasm loaded flag
+
+        // Pre-warm zxing-wasm as early as possible
+        async function initZxWasm() {
+            if (_zxReady) return true;
+            try {
+                if (typeof ZXingWASM === 'undefined') return false;
+                // readBarcodes call with empty data forces WASM to initialise
+                await ZXingWASM.readBarcodes(new ImageData(1, 1), { formats: ['Code128'] });
+                _zxReady = true;
+                console.log('zxing-wasm ready');
+                return true;
+            } catch(e) {
+                console.warn('zxing-wasm init error:', e);
+                return false;
+            }
+        }
+        // Kick off pre-warm immediately (non-blocking)
+        setTimeout(initZxWasm, 500);
 
         function injectScannerCSS() {
             if (document.getElementById('scannerCSS')) return;
@@ -7509,29 +7532,24 @@ Assign a workflow when the vehicle arrives.`);
                     from { transform:translateY(100%); opacity:0; }
                     to   { transform:translateY(0);    opacity:1; }
                 }
-                #h5qr-scanner-region { width:100% !important; height:100% !important; border:none !important; padding:0 !important; }
-                #h5qr-scanner-region video { width:100% !important; height:100% !important; object-fit:cover !important; }
-                #h5qr-scanner-region__header_message,
-                #h5qr-scanner-region__dashboard,
-                #h5qr-scanner-region__dashboard_section,
-                #html5-qrcode-button-camera-start,
-                #html5-qrcode-button-camera-stop,
-                #html5-qrcode-button-camera-permission,
-                #html5-qrcode-anchor-scan-type-change { display:none !important; }
+                @keyframes scanBeam {
+                    0%   { top:6px;  opacity:0.5; }
+                    50%  { top:calc(100% - 8px); opacity:1; }
+                    100% { top:6px;  opacity:0.5; }
+                }
+                #scanBeamLine {
+                    position:absolute; left:0; right:0; height:3px; z-index:10; pointer-events:none;
+                    background:linear-gradient(90deg,transparent,#63b3ed 20%,#90cdf4 50%,#63b3ed 80%,transparent);
+                    animation:scanBeam 1.8s ease-in-out infinite;
+                    border-radius:2px;
+                }
                 #torchBtn.lit {
                     background:rgba(255,220,50,0.25) !important;
                     border-color:rgba(255,220,50,0.8) !important;
                     box-shadow:0 0 14px rgba(255,220,50,0.5) !important;
                 }
-                @keyframes scanBeam {
-                    0%   { top:4px;  opacity:0.4; }
-                    50%  { top:calc(100% - 6px); opacity:1; }
-                    100% { top:4px;  opacity:0.4; }
-                }
-                #scanBeamLine {
-                    position:absolute; left:0; right:0; height:2px; z-index:10; pointer-events:none;
-                    background:linear-gradient(90deg,transparent,#63b3ed,#90cdf4,#63b3ed,transparent);
-                    animation:scanBeam 2s ease-in-out infinite;
+                #vinScannerVideo {
+                    width:100%; height:100%; object-fit:cover; display:block;
                 }
             `;
             document.head.appendChild(s);
@@ -7552,11 +7570,12 @@ Assign a workflow when the vehicle arrives.`);
             modal.style.cssText = 'position:fixed;inset:0;background:#000;z-index:5000;display:flex;flex-direction:column;align-items:center;';
             modal.innerHTML = `
                 <div style="width:100%;max-width:480px;height:100%;display:flex;flex-direction:column;">
+                    <!-- Header -->
                     <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;
                                 background:rgba(0,0,0,0.85);flex-shrink:0;border-bottom:1px solid rgba(255,255,255,0.08);">
                         <div>
                             <div style="color:#fff;font-size:16px;font-weight:700;">📷 VIN Scanner</div>
-                            <div style="color:#718096;font-size:11px;margin-top:1px;">Point camera at barcode or QR code</div>
+                            <div style="color:#718096;font-size:11px;margin-top:1px;">Hold camera steady over the barcode</div>
                         </div>
                         <div style="display:flex;gap:8px;align-items:center;">
                             <button id="torchBtn" onclick="toggleTorch()" title="Flashlight"
@@ -7571,23 +7590,34 @@ Assign a workflow when the vehicle arrives.`);
                                        display:flex;align-items:center;justify-content:center;">✕</button>
                         </div>
                     </div>
+
+                    <!-- Camera -->
                     <div style="position:relative;flex:1;min-height:0;background:#111;overflow:hidden;">
-                        <div id="h5qr-scanner-region" style="width:100%;height:100%;"></div>
+                        <video id="vinScannerVideo" autoplay playsinline muted></video>
+                        <!-- Hidden canvas used for frame capture — never shown -->
+                        <canvas id="vinScanCanvas" style="display:none;"></canvas>
+                        <!-- Animated scan beam -->
                         <div id="scanBeamLine"></div>
+                        <!-- Status chip -->
                         <div id="scanChip" style="position:absolute;top:10px;left:50%;transform:translateX(-50%);
                             background:rgba(66,153,225,0.92);color:white;padding:5px 16px;
                             border-radius:20px;font-size:12px;font-weight:700;white-space:nowrap;
                             backdrop-filter:blur(6px);box-shadow:0 2px 8px rgba(0,0,0,0.3);z-index:20;">
                             ⏳ Starting camera…
                         </div>
+                        <!-- Inventory pill -->
                         <div style="position:absolute;bottom:8px;left:50%;transform:translateX(-50%);
                             background:rgba(0,0,0,0.6);color:#a0aec0;padding:3px 12px;
                             border-radius:20px;font-size:10px;font-weight:600;white-space:nowrap;z-index:20;">
                             ${cacheLabel}
                         </div>
                     </div>
+
+                    <!-- Manual entry -->
                     <div style="padding:14px 16px 20px;background:rgba(0,0,0,0.9);flex-shrink:0;">
-                        <div style="color:#4a5568;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px;">Manual entry</div>
+                        <div style="color:#4a5568;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px;">
+                            Manual entry
+                        </div>
                         <div style="display:flex;gap:8px;">
                             <input id="vinManualInput" type="text" placeholder="VIN or Stock #"
                                 style="flex:1;padding:10px 13px;background:rgba(255,255,255,0.07);
@@ -7602,61 +7632,85 @@ Assign a workflow when the vehicle arrives.`);
                 </div>
             `;
             document.body.appendChild(modal);
-            startH5Scanner();
+            startScannerCamera();
         }
 
-        async function startH5Scanner() {
+        async function startScannerCamera() {
             scannerActive = true;
-            const chip = document.getElementById('scanChip');
+            _torchTrack   = null;
+            const video   = document.getElementById('vinScannerVideo');
+            const chip    = document.getElementById('scanChip');
 
-            if (typeof Html5Qrcode === 'undefined') {
-                if (chip) { chip.style.background='rgba(229,62,62,0.9)'; chip.textContent='❌ Scanner library not loaded'; }
+            // Ensure WASM is loaded
+            await initZxWasm();
+
+            if (!_zxReady) {
+                if (chip) {
+                    chip.style.background = 'rgba(229,62,62,0.9)';
+                    chip.textContent = '❌ Scanner engine failed to load';
+                }
                 return;
             }
 
             try {
-                _h5scanner = new Html5Qrcode('h5qr-scanner-region', { verbose: false });
-
-                const formatsToSupport = [
-                    Html5QrcodeSupportedFormats.QR_CODE,
-                    Html5QrcodeSupportedFormats.CODE_128,
-                    Html5QrcodeSupportedFormats.CODE_39,
-                    Html5QrcodeSupportedFormats.DATA_MATRIX,
-                    Html5QrcodeSupportedFormats.PDF_417,
-                    Html5QrcodeSupportedFormats.EAN_13,
-                    Html5QrcodeSupportedFormats.ITF,
-                    Html5QrcodeSupportedFormats.AZTEC,
-                ];
-
-                const config = {
-                    fps: 10,
-                    aspectRatio: window.innerHeight / window.innerWidth,
-                    formatsToSupport,
-                    experimentalFeatures: { useBarCodeDetectorIfSupported: true }
-                };
-
-                await _h5scanner.start(
-                    { facingMode: 'environment' },
-                    config,
-                    (decodedText) => {
-                        if (scannerActive) handleScanResult(decodedText);
+                _scanStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: { ideal: 'environment' },
+                        width:  { ideal: 1920 },
+                        height: { ideal: 1080 }
                     },
-                    () => {}  // per-frame error is normal
-                );
+                    audio: false
+                });
+                video.srcObject = _scanStream;
+                await video.play();
 
-                if (chip) chip.textContent = '🔍 Scanning…';
-
-                // Show torch if available
-                try {
-                    const caps = _h5scanner.getRunningTrackCapabilities();
-                    if (caps && caps.torch) {
+                // Torch support
+                const tracks = _scanStream.getVideoTracks();
+                if (tracks.length) {
+                    _torchTrack = tracks[0];
+                    const caps = _torchTrack.getCapabilities ? _torchTrack.getCapabilities() : {};
+                    if (caps.torch) {
                         const btn = document.getElementById('torchBtn');
                         if (btn) btn.style.display = 'flex';
                     }
-                } catch(e) {}
+                }
+
+                if (chip) chip.textContent = '🔍 Scanning…';
+
+                // Scan loop: capture frame → canvas → ImageData → zxing-wasm
+                _scanInterval = setInterval(async () => {
+                    if (!scannerActive) return;
+                    if (video.readyState < 2 || video.videoWidth === 0) return;
+
+                    const canvas = document.getElementById('vinScanCanvas');
+                    if (!canvas) return;
+                    const vw = video.videoWidth;
+                    const vh = video.videoHeight;
+                    canvas.width  = vw;
+                    canvas.height = vh;
+                    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                    ctx.drawImage(video, 0, 0, vw, vh);
+                    const imageData = ctx.getImageData(0, 0, vw, vh);
+
+                    try {
+                        const results = await ZXingWASM.readBarcodes(imageData, {
+                            formats: ['Code128', 'Code39', 'QRCode', 'DataMatrix', 'PDF417', 'Aztec', 'ITF', 'EAN13'],
+                            tryHarder: true,
+                            tryRotate: true,
+                            tryInvert: true,
+                        });
+                        if (results && results.length > 0) {
+                            const text = results[0].text;
+                            if (text && text.length >= 4) {
+                                handleScanResult(text);
+                            }
+                        }
+                    } catch(e) { /* decode error on this frame — skip */ }
+
+                }, 250); // 4fps — enough for steady hand, gentle on iPhone CPU
 
             } catch(err) {
-                console.warn('html5-qrcode start error:', err);
+                console.warn('Camera error:', err);
                 if (chip) {
                     chip.style.background = 'rgba(229,62,62,0.9)';
                     chip.textContent = '📵 Camera error — use manual entry';
@@ -7665,17 +7719,17 @@ Assign a workflow when the vehicle arrives.`);
         }
 
         async function toggleTorch() {
-            if (!_h5scanner) return;
+            if (!_torchTrack) return;
             try {
                 torchOn = !torchOn;
-                await _h5scanner.applyVideoConstraints({ advanced: [{ torch: torchOn }] });
+                await _torchTrack.applyConstraints({ advanced: [{ torch: torchOn }] });
                 const btn = document.getElementById('torchBtn');
                 if (btn) {
                     btn.classList.toggle('lit', torchOn);
                     btn.title = torchOn ? 'Turn flashlight off' : 'Turn flashlight on';
                 }
             } catch(e) {
-                console.warn('Torch toggle error:', e);
+                console.warn('Torch error:', e);
                 torchOn = !torchOn;
             }
         }
@@ -7684,9 +7738,17 @@ Assign a workflow when the vehicle arrives.`);
             if (!scannerActive) return;
             scannerActive = false;
 
-            const chip = document.getElementById('scanChip');
+            clearInterval(_scanInterval);
+            _scanInterval = null;
+            if (torchOn && _torchTrack) {
+                try { _torchTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch(e) {}
+                torchOn = false;
+            }
+            if (_scanStream) { _scanStream.getTracks().forEach(t => t.stop()); _scanStream = null; }
+
+            const chip    = document.getElementById('scanChip');
             const cleaned = raw.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-            const hit = lookupInCache(cleaned);
+            const hit     = lookupInCache(cleaned);
 
             if (chip) {
                 chip.style.background = hit ? 'rgba(72,187,120,0.95)' : 'rgba(229,62,62,0.92)';
@@ -7704,13 +7766,17 @@ Assign a workflow when the vehicle arrives.`);
 
         function closeVinScanner() {
             scannerActive = false;
-            torchOn = false;
-            if (_h5scanner) {
-                _h5scanner.stop().catch(() => {}).finally(() => { _h5scanner = null; });
+            clearInterval(_scanInterval);
+            _scanInterval = null;
+            if (torchOn && _torchTrack) {
+                try { _torchTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch(e) {}
+                torchOn = false;
             }
+            if (_scanStream) { _scanStream.getTracks().forEach(t => t.stop()); _scanStream = null; }
             const m = document.getElementById('vinScannerModal');
             if (m) m.remove();
         }
+
 
         function lookupVinManual() {
             const input = document.getElementById('vinManualInput');
