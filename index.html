@@ -7543,7 +7543,6 @@ Assign a workflow when the vehicle arrives.`);
             const fractions = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65];
             for (const rf of fractions) {
                 const y = Math.floor(height * rf);
-                // Build luminance row
                 const lum = new Uint8Array(width);
                 let sum = 0;
                 for (let x = 0; x < width; x++) {
@@ -7552,13 +7551,17 @@ Assign a workflow when the vehicle arrives.`);
                     sum += lum[x];
                 }
                 const mean = sum / width;
-                // Try several thresholds
                 for (const tm of [0.75, 0.70, 0.80, 0.65, 0.85]) {
                     const thresh = mean * tm;
                     const runs = buildRuns(lum, width, thresh);
+                    // Try Code 39 first — most OEM VIN stickers use it
+                    const c39f = tryCode39(runs);
+                    if (c39f) return c39f;
+                    const c39r = tryCode39(runs.slice().reverse());
+                    if (c39r) return c39r;
+                    // Fall back to Code 128
                     const fwd = tryCode128(runs);
                     if (fwd) return fwd;
-                    // Reverse
                     const rev = tryCode128(runs.slice().reverse());
                     if (rev) return rev;
                 }
@@ -7578,14 +7581,83 @@ Assign a workflow when the vehicle arrives.`);
             return runs;
         }
 
+        // ── Code 39 decoder ──────────────────────────────────────────────────────
+        // Each character = 9 elements (5 bars, 4 spaces), alternating dark/light.
+        // Bars/spaces are either narrow (1 module) or wide (≈2.5–3 modules).
+        // Start and stop are both '*'. We strip them from output.
+        // Two tables: forward and reversed (for upside-down barcodes).
+
+        const C39_TABLE = (function() {
+            const fwd = {
+                "000110100":"0","100100001":"1","001100001":"2","101100000":"3",
+                "000110001":"4","100110000":"5","001110000":"6","000100101":"7",
+                "100100100":"8","001100100":"9","100001001":"A","001001001":"B",
+                "101001000":"C","000011001":"D","100011000":"E","001011000":"F",
+                "000001101":"G","100001100":"H","001001100":"I","000011100":"J",
+                "100000011":"K","001000011":"L","101000010":"M","000010011":"N",
+                "100010010":"O","001010010":"P","000000111":"Q","100000110":"R",
+                "001000110":"S","000010110":"T","110000001":"U","011000001":"V",
+                "111000000":"W","010010001":"X","110010000":"Y","011010000":"Z",
+                "010000101":"-","110000100":".","011000100":" ","010101000":"$",
+                "010100010":"/","010001010":"+","000101010":"%","010010100":"*"
+            };
+            // Build reverse table: each symbol's 9-bit key reversed
+            const rev = {};
+            for (const [bits, ch] of Object.entries(fwd))
+                rev[bits.split("").reverse().join("")] = ch;
+            return { fwd, rev };
+        })();
+
+        function tryCode39(runs) {
+            const allW = runs.map(r => r[1]).sort((a,b) => a-b);
+            const narrow = allW[Math.floor(allW.length * 0.15)] || 1;
+            const wideThresh = narrow * 1.8;
+
+            // Try both forward and reverse tables (handles upside-down barcodes)
+            for (const [table, reversed] of [[C39_TABLE.fwd, false], [C39_TABLE.rev, true]]) {
+                for (let ri = 0; ri + 8 < runs.length; ri++) {
+                    if (!runs[ri][0]) continue;
+
+                    const sym = _c39sym(runs, ri, wideThresh, table);
+                    if (sym !== "*") continue;
+
+                    const chars = [];
+                    let pos = ri + 9 + 1; // 9 symbol elements + 1 inter-char gap
+
+                    while (pos + 8 < runs.length) {
+                        const c = _c39sym(runs, pos, wideThresh, table);
+                        if (c === null) break;
+                        if (c === "*") {
+                            // Rev table scans a reversed barcode so chars come out backwards
+                            if (reversed) chars.reverse();
+                            const result = chars.join("").replace(/[^A-Za-z0-9]/g, "");
+                            if (result.length >= 6) return result;
+                            break;
+                        }
+                        chars.push(c);
+                        pos += 9 + 1;
+                    }
+                }
+            }
+            return null;
+        }
+
+        function _c39sym(runs, ri, wideThresh, table) {
+            if (ri + 8 >= runs.length) return null;
+            let bits = "";
+            for (let k = 0; k < 9; k++) {
+                if (ri + k >= runs.length) return null;
+                bits += runs[ri+k][1] >= wideThresh ? "1" : "0";
+            }
+            return table[bits] !== undefined ? table[bits] : null;
+        }
+
+        // ── Code 128 decoder ─────────────────────────────────────────────────────
+
         function tryCode128(runs) {
-            // ── Module width estimation ──────────────────────────────────────────
-            // Build a histogram of run widths and find the dominant small-run peak.
-            // This is far more reliable than a flat percentile because quiet zones
-            // create a large cluster of wide runs that skew percentile estimates.
+            // Module width: most-common run width in the smaller half (avoids quiet-zone bias)
             const hist = {};
             for (const r of runs) { hist[r[1]] = (hist[r[1]] || 0) + 1; }
-            // Find the most-common width among runs ≤ median width
             const allW = runs.map(r => r[1]).sort((a,b) => a-b);
             const medW = allW[Math.floor(allW.length * 0.5)] || 1;
             let bestCount = 0, bestW = 1;
@@ -7595,11 +7667,9 @@ Assign a workflow when the vehicle arrives.`);
             }
             const mod = bestW || 1;
 
-            // ── Start-symbol scan ────────────────────────────────────────────────
             for (let ri = 0; ri + 5 < runs.length; ri++) {
-                if (!runs[ri][0]) continue; // must start on dark bar
-
-                const sv = matchSym(runs, ri, mod);
+                if (!runs[ri][0]) continue;
+                const sv = matchSym128(runs, ri, mod);
                 let charset;
                 if      (sv === 103) charset = "A";
                 else if (sv === 104) charset = "B";
@@ -7610,14 +7680,8 @@ Assign a workflow when the vehicle arrives.`);
                 const chars = [];
                 let valid = false;
 
-                // Code-128 stop symbol = 7 elements [2,3,3,1,1,1,2] + 13 modules
-                // We treat it specially: after matching the 6-element table value 106
-                // (which is the "pre-stop" portion), the 7th element is a trailing bar.
-                // Strategy: accept val===106 OR detect a 13-module stop pattern directly.
                 while (pos + 5 < runs.length) {
-                    const val = matchSym(runs, pos, mod);
-
-                    // Check for stop symbol: 7-element [2,3,3,1,1,1,2] = 13 modules
+                    // Check for 7-element stop symbol BEFORE trying to decode as data
                     if (pos + 6 < runs.length && runs[pos][0]) {
                         const st = runs[pos][1]+runs[pos+1][1]+runs[pos+2][1]+runs[pos+3][1]+runs[pos+4][1]+runs[pos+5][1]+runs[pos+6][1];
                         const sm = st / 13.0;
@@ -7629,19 +7693,18 @@ Assign a workflow when the vehicle arrives.`);
                         if (stopOk) { valid = true; break; }
                     }
 
+                    const val = matchSym128(runs, pos, mod);
                     if (val < 0) break;
-                    if (val === 106) { valid = true; break; }   // stop (6-elem match fallback)
+                    if (val === 106) { valid = true; break; }
                     if (val === 99)  { charset = "C"; pos += 6; continue; }
                     if (val === 100) { charset = "B"; pos += 6; continue; }
                     if (val === 101) { charset = "A"; pos += 6; continue; }
                     if (val === 102 || val === 97 || val === 96) { pos += 6; continue; }
-                    chars.push(valToChar(val, charset));
+                    chars.push(valToChar128(val, charset));
                     pos += 6;
                 }
 
-                // The last decoded symbol before the stop is ALWAYS the Code 128
-                // check character — strip it. It is NOT data; it's a mod-103
-                // checksum of all prior values. Including it produces garbage output.
+                // Strip the mandatory Code 128 check character (always last before stop)
                 if (chars.length > 0) chars.pop();
 
                 const result = chars.join("").replace(/[^A-Za-z0-9]/g, "");
@@ -7650,13 +7713,11 @@ Assign a workflow when the vehicle arrives.`);
             return null;
         }
 
-        function matchSym(runs, ri, mod) {
+        function matchSym128(runs, ri, mod) {
             if (ri + 5 >= runs.length) return -1;
-            // Use this symbol's own total to refine mod estimate (each symbol = 11 modules)
             const symTotal = runs[ri][1]+runs[ri+1][1]+runs[ri+2][1]+runs[ri+3][1]+runs[ri+4][1]+runs[ri+5][1];
             const symMod = symTotal / 11.0;
-            // Try several mod estimates; track best (lowest-error) match across all
-            let bestVal = -1, bestErr = 0.75; // tolerance per element in modules
+            let bestVal = -1, bestErr = 0.75;
             for (const m of [symMod, mod, (symMod + mod) / 2]) {
                 if (m < 0.5) continue;
                 for (let i = 0; i < C128_TABLE.length; i++) {
@@ -7673,7 +7734,7 @@ Assign a workflow when the vehicle arrives.`);
             return bestVal;
         }
 
-        function valToChar(val, charset) {
+        function valToChar128(val, charset) {
             if (charset === "C") return String(val).padStart(2, "0");
             if (charset === "B" && val <= 94) return String.fromCharCode(val + 32);
             if (charset === "A") {
