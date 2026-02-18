@@ -7532,15 +7532,18 @@ Assign a workflow when the vehicle arrives.`);
             return "r:" + darkRuns + " t:" + transitions + " lum:" + Math.round(mean) + " min:" + (minRun===9999?0:minRun) + " max:" + maxRun;
         }
 
-        // ── Barcode decoder (ratio-based Code-128) ─────────────────────────
-        // Uses edge ratios instead of integer rounding — handles real camera images
-        // where bars are never perfectly sharp. This is how production scanners work.
+        // ── Barcode decoder ───────────────────────────────────────────────────
+        // Histogram-based Code-128 decoder. Finds the module width from the
+        // distribution of all run widths in the row, then matches patterns.
+
+        const C128_TABLE = [[2,1,2,2,2,2],[2,2,2,1,2,2],[2,2,2,2,2,1],[1,2,1,2,2,3],[1,2,1,3,2,2],[1,3,1,2,2,2],[1,2,2,2,1,3],[1,2,2,3,1,2],[1,3,2,2,1,2],[2,2,1,2,1,3],[2,2,1,3,1,2],[2,3,1,2,1,2],[1,1,2,2,3,2],[1,2,2,1,3,2],[1,2,2,2,3,1],[1,1,3,2,2,2],[1,2,3,1,2,2],[1,2,3,2,2,1],[2,2,3,2,1,1],[2,2,1,1,3,2],[2,2,1,2,3,1],[2,1,3,2,1,2],[2,2,3,1,1,2],[3,1,2,1,3,1],[3,1,1,2,2,2],[3,2,1,1,2,2],[3,2,1,2,2,1],[3,1,2,2,1,2],[3,2,2,1,1,2],[3,2,2,2,1,1],[2,1,2,1,2,3],[2,1,2,3,2,1],[2,3,2,1,2,1],[1,1,1,3,2,3],[1,3,1,1,2,3],[1,3,1,3,2,1],[1,1,2,3,1,3],[1,3,2,1,1,3],[1,3,2,3,1,1],[2,1,1,3,1,3],[2,3,1,1,1,3],[2,3,1,3,1,1],[1,1,2,1,3,3],[1,1,2,3,3,1],[1,3,2,1,3,1],[1,1,3,1,2,3],[1,1,3,3,2,1],[1,3,3,1,2,1],[3,1,3,1,2,1],[2,1,1,3,3,1],[2,3,1,1,3,1],[2,1,3,1,1,3],[2,1,3,3,1,1],[2,1,3,1,3,1],[3,1,1,1,2,3],[3,1,1,3,2,1],[3,3,1,1,2,1],[3,1,2,1,1,3],[3,1,2,3,1,1],[3,3,2,1,1,1],[3,1,4,1,1,1],[2,2,1,4,1,1],[4,3,1,1,1,1],[1,1,1,2,2,4],[1,1,1,4,2,2],[1,2,1,1,2,4],[1,2,1,4,2,1],[1,4,1,1,2,2],[1,4,1,2,2,1],[1,1,2,2,1,4],[1,1,2,4,1,2],[1,2,2,1,1,4],[1,2,2,4,1,1],[1,4,2,1,1,2],[1,4,2,2,1,1],[2,4,1,2,1,1],[2,2,1,1,1,4],[4,1,3,1,1,1],[2,4,1,1,1,2],[1,3,4,1,1,1],[1,1,1,2,4,2],[1,2,1,1,4,2],[1,2,1,2,4,1],[1,1,4,2,1,2],[1,2,4,1,1,2],[1,2,4,2,1,1],[4,1,1,2,1,2],[4,2,1,1,1,2],[4,2,1,2,1,1],[2,1,2,1,4,1],[2,1,4,1,2,1],[4,1,2,1,2,1],[1,1,1,1,4,3],[1,1,1,3,4,1],[1,3,1,1,4,1],[1,1,4,1,1,3],[1,1,4,3,1,1],[4,1,1,1,1,3],[4,1,1,3,1,1],[1,1,3,1,4,1],[1,1,4,1,3,1],[3,1,1,1,4,1],[4,1,1,1,3,1],[2,1,1,4,1,2],[2,1,1,2,1,4],[2,1,1,2,3,2],[2,3,3,1,1,1]];
 
         function decodeBarcodeFromImageData(imageData) {
             const { data, width, height } = imageData;
-            const rowFractions = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65];
-            for (const rf of rowFractions) {
+            const fractions = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65];
+            for (const rf of fractions) {
                 const y = Math.floor(height * rf);
+                // Build luminance row
                 const lum = new Uint8Array(width);
                 let sum = 0;
                 for (let x = 0; x < width; x++) {
@@ -7549,140 +7552,64 @@ Assign a workflow when the vehicle arrives.`);
                     sum += lum[x];
                 }
                 const mean = sum / width;
-
-                // Try multiple threshold multipliers — bright scenes need a lower one
-                for (const tmult of [0.75, 0.80, 0.70, 0.85, 0.65]) {
-                    const thresh = mean * tmult;
-                    const r = decodeRow(lum, width, thresh, false);
-                    if (r) return r;
-                    const r2 = decodeRow(lum, width, thresh, true);
-                    if (r2) return r2;
+                // Try several thresholds
+                for (const tm of [0.75, 0.70, 0.80, 0.65, 0.85]) {
+                    const thresh = mean * tm;
+                    const runs = buildRuns(lum, width, thresh);
+                    const fwd = tryCode128(runs);
+                    if (fwd) return fwd;
+                    // Reverse
+                    const rev = tryCode128(runs.slice().reverse());
+                    if (rev) return rev;
                 }
             }
             return null;
         }
 
-        function decodeRow(lum, width, threshold, reversed) {
-            const src = reversed ? Array.from(lum).reverse() : lum;
+        function buildRuns(lum, width, thresh) {
             const runs = [];
-            let curDark = src[0] < threshold;
-            let len = 1;
+            let curDark = lum[0] < thresh, len = 1;
             for (let x = 1; x < width; x++) {
-                const dark = src[x] < threshold;
+                const dark = lum[x] < thresh;
                 if (dark === curDark) { len++; }
                 else { runs.push([curDark, len]); curDark = dark; len = 1; }
             }
             runs.push([curDark, len]);
-            return tryCode128(runs);
-        }
-
-        // ── Code-128 decoder — ratio method ──────────────────────────────────
-        //
-        // Instead of converting bar widths to integer module counts (which fails
-        // when the camera image is slightly blurry or skewed), we compare the
-        // RATIOS of adjacent element widths to the known Code-128 patterns.
-        //
-        // Each Code-128 symbol = 3 bars + 3 spaces = 6 elements, total 11 units.
-        // Possible individual widths: 1, 2, 3, or 4 units.
-        // We classify each element as 1/2/3/4 by comparing to the symbol's own
-        // average width (totalWidth/11), with generous ±40% tolerance.
-
-        const C128_TABLE = [
-            [2,1,2,2,2,2],[2,2,2,1,2,2],[2,2,2,2,2,1],[1,2,1,2,2,3],[1,2,1,3,2,2],
-            [1,3,1,2,2,2],[1,2,2,2,1,3],[1,2,2,3,1,2],[1,3,2,2,1,2],[2,2,1,2,1,3],
-            [2,2,1,3,1,2],[2,3,1,2,1,2],[1,1,2,2,3,2],[1,2,2,1,3,2],[1,2,2,2,3,1],
-            [1,1,3,2,2,2],[1,2,3,1,2,2],[1,2,3,2,2,1],[2,2,3,2,1,1],[2,2,1,1,3,2],
-            [2,2,1,2,3,1],[2,1,3,2,1,2],[2,2,3,1,1,2],[3,1,2,1,3,1],[3,1,1,2,2,2],
-            [3,2,1,1,2,2],[3,2,1,2,2,1],[3,1,2,2,1,2],[3,2,2,1,1,2],[3,2,2,2,1,1],
-            [2,1,2,1,2,3],[2,1,2,3,2,1],[2,3,2,1,2,1],[1,1,1,3,2,3],[1,3,1,1,2,3],
-            [1,3,1,3,2,1],[1,1,2,3,1,3],[1,3,2,1,1,3],[1,3,2,3,1,1],[2,1,1,3,1,3],
-            [2,3,1,1,1,3],[2,3,1,3,1,1],[1,1,2,1,3,3],[1,1,2,3,3,1],[1,3,2,1,3,1],
-            [1,1,3,1,2,3],[1,1,3,3,2,1],[1,3,3,1,2,1],[3,1,3,1,2,1],[2,1,1,3,3,1],
-            [2,3,1,1,3,1],[2,1,3,1,1,3],[2,1,3,3,1,1],[2,1,3,1,3,1],[3,1,1,1,2,3],
-            [3,1,1,3,2,1],[3,3,1,1,2,1],[3,1,2,1,1,3],[3,1,2,3,1,1],[3,3,2,1,1,1],
-            [3,1,4,1,1,1],[2,2,1,4,1,1],[4,3,1,1,1,1],[1,1,1,2,2,4],[1,1,1,4,2,2],
-            [1,2,1,1,2,4],[1,2,1,4,2,1],[1,4,1,1,2,2],[1,4,1,2,2,1],[1,1,2,2,1,4],
-            [1,1,2,4,1,2],[1,2,2,1,1,4],[1,2,2,4,1,1],[1,4,2,1,1,2],[1,4,2,2,1,1],
-            [2,4,1,2,1,1],[2,2,1,1,1,4],[4,1,3,1,1,1],[2,4,1,1,1,2],[1,3,4,1,1,1],
-            [1,1,1,2,4,2],[1,2,1,1,4,2],[1,2,1,2,4,1],[1,1,4,2,1,2],[1,2,4,1,1,2],
-            [1,2,4,2,1,1],[4,1,1,2,1,2],[4,2,1,1,1,2],[4,2,1,2,1,1],[2,1,2,1,4,1],
-            [2,1,4,1,2,1],[4,1,2,1,2,1],[1,1,1,1,4,3],[1,1,1,3,4,1],[1,3,1,1,4,1],
-            [1,1,4,1,1,3],[1,1,4,3,1,1],[4,1,1,1,1,3],[4,1,1,3,1,1],[1,1,3,1,4,1],
-            [1,1,4,1,3,1],[3,1,1,1,4,1],[4,1,1,1,3,1],[2,1,1,4,1,2],[2,1,1,2,1,4],
-            [2,1,1,2,3,2],[2,3,3,1,1,1]
-        ];
-
-        function matchSymbol(w0,w1,w2,w3,w4,w5) {
-            // Use the symbol's own total width to derive module size
-            const total = w0+w1+w2+w3+w4+w5;
-            const mod = total / 11.0;
-            // Tolerance: ±0.5 modules is generous but catches real camera images
-            const TOL = 0.65;
-            const ws = [w0,w1,w2,w3,w4,w5];
-            for (let i = 0; i < C128_TABLE.length; i++) {
-                const pat = C128_TABLE[i];
-                let ok = true;
-                for (let k = 0; k < 6; k++) {
-                    if (Math.abs(ws[k]/mod - pat[k]) > TOL) { ok = false; break; }
-                }
-                if (ok) return i;
-            }
-            return -1;
-        }
-
-        function c128char(val, charset) {
-            if (charset === "C") return String(val).padStart(2, "0");
-            if (charset === "B" && val <= 94) return String.fromCharCode(val + 32);
-            if (charset === "A") {
-                if (val <= 63) return String.fromCharCode(val + 32);
-                if (val <= 95) return String.fromCharCode(val - 64);
-            }
-            return "";
+            return runs;
         }
 
         function tryCode128(runs) {
-            // Scan for a valid start character anywhere in the run array
-            // (handles quiet zone variations and partial frames)
-            for (let ri = 0; ri + 6 < runs.length; ri++) {
-                // Must start on a dark bar
-                if (!runs[ri][0]) continue;
+            // Estimate module width from the SMALLEST runs in the entire row
+            // (the narrowest bars/spaces = 1 module wide)
+            const allW = runs.map(r => r[1]);
+            allW.sort((a,b) => a-b);
+            // Use 15th percentile of all run widths as the 1-module estimate
+            const mod = allW[Math.floor(allW.length * 0.15)] || 1;
 
-                const startVal = matchSymbol(
-                    runs[ri][1], runs[ri+1][1], runs[ri+2][1],
-                    runs[ri+3][1], runs[ri+4][1], runs[ri+5][1]
-                );
+            // Scan for start character
+            for (let ri = 0; ri + 5 < runs.length; ri++) {
+                if (!runs[ri][0]) continue; // must start on dark bar
 
+                const sv = matchSym(runs, ri, mod);
                 let charset;
-                if (startVal === 103) charset = "A";
-                else if (startVal === 104) charset = "B";
-                else if (startVal === 105) charset = "C";
-                else continue;  // not a valid start — keep scanning
+                if (sv === 103) charset = "A";
+                else if (sv === 104) charset = "B";
+                else if (sv === 105) charset = "C";
+                else continue;
 
                 let pos = ri + 6;
                 const chars = [];
-                let checksum = startVal;
-                let cpos = 1;
                 let valid = false;
 
                 while (pos + 5 < runs.length) {
-                    const val = matchSymbol(
-                        runs[pos][1], runs[pos+1][1], runs[pos+2][1],
-                        runs[pos+3][1], runs[pos+4][1], runs[pos+5][1]
-                    );
-                    if (val < 0) break; // unrecognised — abort this candidate
-
-                    if (val === 106) { valid = true; break; } // stop character
-
-                    checksum += val * cpos++;
-
-                    // Charset switches
-                    if (val === 99) { charset = "C"; pos += 6; continue; }
+                    const val = matchSym(runs, pos, mod);
+                    if (val < 0) break;
+                    if (val === 106) { valid = true; break; }
+                    if (val === 99)  { charset = "C"; pos += 6; continue; }
                     if (val === 100) { charset = "B"; pos += 6; continue; }
                     if (val === 101) { charset = "A"; pos += 6; continue; }
-                    // FNC characters (102=FNC1, 97=FNC2, 96=FNC3) — skip
                     if (val === 102 || val === 97 || val === 96) { pos += 6; continue; }
-
-                    chars.push(c128char(val, charset));
+                    chars.push(valToChar(val, charset));
                     pos += 6;
                 }
 
@@ -7692,6 +7619,36 @@ Assign a workflow when the vehicle arrives.`);
                 }
             }
             return null;
+        }
+
+        function matchSym(runs, ri, mod) {
+            if (ri + 5 >= runs.length) return -1;
+            // Use this symbol's own total to refine mod estimate
+            const symTotal = runs[ri][1]+runs[ri+1][1]+runs[ri+2][1]+runs[ri+3][1]+runs[ri+4][1]+runs[ri+5][1];
+            const symMod = symTotal / 11.0;
+            // Use whichever mod estimate gives a cleaner fit
+            for (const m of [symMod, mod, (symMod+mod)/2]) {
+                if (m < 0.5) continue;
+                for (let i = 0; i < C128_TABLE.length; i++) {
+                    const p = C128_TABLE[i];
+                    let ok = true;
+                    for (let k = 0; k < 6; k++) {
+                        if (Math.abs(runs[ri+k][1]/m - p[k]) > 0.7) { ok = false; break; }
+                    }
+                    if (ok) return i;
+                }
+            }
+            return -1;
+        }
+
+        function valToChar(val, charset) {
+            if (charset === "C") return String(val).padStart(2, "0");
+            if (charset === "B" && val <= 94) return String.fromCharCode(val + 32);
+            if (charset === "A") {
+                if (val <= 63) return String.fromCharCode(val + 32);
+                if (val <= 95) return String.fromCharCode(val - 64);
+            }
+            return "";
         }
 
         // ── Scanner UI ────────────────────────────────────────────────────────
@@ -7770,9 +7727,9 @@ Assign a workflow when the vehicle arrives.`);
                     _torchTrack = tracks[0];
                     const caps = _torchTrack.getCapabilities ? _torchTrack.getCapabilities() : {};
                     if (caps.torch) { const b = document.getElementById("torchBtn"); if (b) b.style.display = "flex"; }
-                    // Apply 2× zoom if the camera supports it — doubles pixel density on the barcode
-                    if (caps.zoom && caps.zoom.max >= 2) {
-                        try { await _torchTrack.applyConstraints({ advanced: [{ zoom: 2 }] }); } catch(e) {}
+                    // Reset zoom to 1x — zooming in crops the barcode start/stop symbols off-screen
+                    if (caps.zoom) {
+                        try { await _torchTrack.applyConstraints({ advanced: [{ zoom: 1 }] }); } catch(e) {}
                     }
                 }
                 if (chip) chip.textContent = "🔍 Scanning…";
@@ -7786,22 +7743,17 @@ Assign a workflow when the vehicle arrives.`);
                     const vw = video.videoWidth;
                     const vh = video.videoHeight;
 
-                    // Crop to the center 60% height strip — where the barcode is
-                    // This gives 1.67× more pixels per bar vs using the full frame
+                    // Use FULL width — never downscale horizontally or the start/stop
+                    // symbols get cropped when the barcode fills the frame.
+                    // Only crop vertically to the center 60% strip for speed.
                     const cropY = Math.floor(vh * 0.20);
                     const cropH = Math.floor(vh * 0.60);
 
-                    // Keep full width but cap at 1280 for performance
-                    const scale = Math.min(1, 1280 / vw);
-                    const w = Math.floor(vw * scale);
-                    const h = Math.floor(cropH * scale);
-
-                    canvas.width  = w;
-                    canvas.height = h;
+                    canvas.width  = vw;
+                    canvas.height = cropH;
                     const ctx = canvas.getContext("2d", { willReadFrequently: true });
-                    // Draw only the cropped strip
-                    ctx.drawImage(video, 0, cropY, vw, cropH, 0, 0, w, h);
-                    const imgData = ctx.getImageData(0, 0, w, h);
+                    ctx.drawImage(video, 0, cropY, vw, cropH, 0, 0, vw, cropH);
+                    const imgData = ctx.getImageData(0, 0, vw, cropH);
                     const result = decodeBarcodeFromImageData(imgData);
                     if (result && result.length >= 4) {
                         handleScanResult(result);
