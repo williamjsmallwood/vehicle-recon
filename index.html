@@ -7877,7 +7877,10 @@ Assign a workflow when the vehicle arrives.`);
             _scanStream = null;
             const chip = document.getElementById("scanChip");
             let cleaned = raw.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-            if (cleaned.length === 18 && cleaned.charAt(0) === 'I') cleaned = cleaned.slice(1);
+            // I, O, Q are forbidden VIN characters (ISO 3779).
+            // OEM stickers often prepend 'I' as a label identifier — always strip it.
+            // Strip any number of leading I's since none can be part of a real VIN.
+            cleaned = cleaned.replace(/^I+/, "");
             const hit = lookupInCache(cleaned);
             if (chip) { chip.style.background = hit ? "rgba(72,187,120,.95)" : "rgba(229,62,62,.92)"; chip.textContent = hit ? "✅ Found!" : "🚫 Not in recon"; }
             playScanBeep(!!hit);
