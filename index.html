@@ -7639,9 +7639,13 @@ Assign a workflow when the vehicle arrives.`);
                     pos += 6;
                 }
 
-                // Accept even without a clean stop if we decoded a plausible VIN
+                // The last decoded symbol before the stop is ALWAYS the Code 128
+                // check character — strip it. It is NOT data; it's a mod-103
+                // checksum of all prior values. Including it produces garbage output.
+                if (chars.length > 0) chars.pop();
+
                 const result = chars.join("").replace(/[^A-Za-z0-9]/g, "");
-                if (result.length >= 6 && (valid || chars.length >= 10)) return result;
+                if (result.length >= 6 && valid) return result;
             }
             return null;
         }
