@@ -7517,17 +7517,19 @@ Assign a workflow when the vehicle arrives.`);
                 sum += lum[x];
             }
             const mean = sum / width;
-            // Count dark/light transitions
-            let transitions = 0;
-            let darkRuns = 0;
-            const thresh = mean * 0.85;
-            let prev = lum[0] < thresh;
+            const thresh = mean * 0.75;
+            let transitions = 0, darkRuns = 0, minRun = 9999, maxRun = 0;
+            let prev = lum[0] < thresh, runLen = 1;
             for (let x = 1; x < width; x++) {
                 const d = lum[x] < thresh;
-                if (d !== prev) { transitions++; if (d) darkRuns++; }
+                if (d !== prev) {
+                    transitions++;
+                    if (prev) { darkRuns++; minRun = Math.min(minRun, runLen); maxRun = Math.max(maxRun, runLen); }
+                    runLen = 1;
+                } else runLen++;
                 prev = d;
             }
-            return "runs:" + darkRuns + " trans:" + transitions + " lum:" + Math.round(mean);
+            return "r:" + darkRuns + " t:" + transitions + " lum:" + Math.round(mean) + " min:" + (minRun===9999?0:minRun) + " max:" + maxRun;
         }
 
         // ── Barcode decoder (ratio-based Code-128) ─────────────────────────
@@ -7536,50 +7538,41 @@ Assign a workflow when the vehicle arrives.`);
 
         function decodeBarcodeFromImageData(imageData) {
             const { data, width, height } = imageData;
-            // Sample rows across middle 50% of frame, try both directions
             const rowFractions = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65];
             for (const rf of rowFractions) {
                 const y = Math.floor(height * rf);
                 const lum = new Uint8Array(width);
+                let sum = 0;
                 for (let x = 0; x < width; x++) {
-                    const idx = (y * width + x) * 4;
-                    lum[x] = (data[idx]*77 + data[idx+1]*150 + data[idx+2]*29) >> 8;
+                    const i = (y * width + x) * 4;
+                    lum[x] = (data[i]*77 + data[i+1]*150 + data[i+2]*29) >> 8;
+                    sum += lum[x];
                 }
-                // Try left-to-right
-                const fwd = decodeRow(lum, width, false);
-                if (fwd) return fwd;
-                // Try right-to-left (barcode might be upside down)
-                const rev = decodeRow(lum, width, true);
-                if (rev) return rev;
+                const mean = sum / width;
+
+                // Try multiple threshold multipliers — bright scenes need a lower one
+                for (const tmult of [0.75, 0.80, 0.70, 0.85, 0.65]) {
+                    const thresh = mean * tmult;
+                    const r = decodeRow(lum, width, thresh, false);
+                    if (r) return r;
+                    const r2 = decodeRow(lum, width, thresh, true);
+                    if (r2) return r2;
+                }
             }
             return null;
         }
 
-        function decodeRow(lum, width, reversed) {
-            // Local adaptive threshold using sliding window
-            const WIN = Math.floor(width / 8);
-            const threshold = new Uint8Array(width);
-            for (let x = 0; x < width; x++) {
-                const lo = Math.max(0, x - WIN);
-                const hi = Math.min(width - 1, x + WIN);
-                let s = 0;
-                for (let j = lo; j <= hi; j++) s += lum[j];
-                threshold[x] = s / (hi - lo + 1) * 0.85;
-            }
-
-            // Build run array [isDark, length]
+        function decodeRow(lum, width, threshold, reversed) {
             const src = reversed ? Array.from(lum).reverse() : lum;
-            const thr = reversed ? Array.from(threshold).reverse() : threshold;
             const runs = [];
-            let curDark = src[0] < thr[0];
+            let curDark = src[0] < threshold;
             let len = 1;
             for (let x = 1; x < width; x++) {
-                const dark = src[x] < thr[x];
+                const dark = src[x] < threshold;
                 if (dark === curDark) { len++; }
                 else { runs.push([curDark, len]); curDark = dark; len = 1; }
             }
             runs.push([curDark, len]);
-
             return tryCode128(runs);
         }
 
@@ -7767,7 +7760,7 @@ Assign a workflow when the vehicle arrives.`);
             const chip  = document.getElementById("scanChip");
             try {
                 _scanStream = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+                    video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
                     audio: false
                 });
                 video.srcObject = _scanStream;
@@ -7785,7 +7778,7 @@ Assign a workflow when the vehicle arrives.`);
                     if (video.readyState < 2 || video.videoWidth === 0) return;
                     const canvas = document.getElementById("vinScanCanvas");
                     if (!canvas) return;
-                    const scale = Math.min(1, 640 / video.videoWidth);
+                    const scale = Math.min(1, 960 / video.videoWidth);
                     const w = Math.floor(video.videoWidth * scale);
                     const h = Math.floor(video.videoHeight * scale);
                     canvas.width = w; canvas.height = h;
