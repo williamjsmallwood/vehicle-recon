@@ -1912,6 +1912,36 @@
             }
         }
 
+        // ── Clear all Finished vehicles (manager+ only) ───────────────────
+        async function clearFinishedBucket() {
+            const finishedVehicles = vehicles.filter(v => v.currentStep === 'Finished');
+            if (finishedVehicles.length === 0) return;
+
+            const confirmed = confirm(`Clear all ${finishedVehicles.length} vehicles from Finished?\n\nThey will be removed from the board but remain searchable with full history.`);
+            if (!confirmed) return;
+
+            try {
+                const ids = finishedVehicles.map(v => v.id);
+                const { error } = await supabaseClient
+                    .from('vehicles')
+                    .update({ workflow: 'COMPLETED', updated_at: new Date().toISOString() })
+                    .in('id', ids);
+
+                if (error) {
+                    alert('⚠️ Failed to clear Finished: ' + error.message);
+                    return;
+                }
+
+                // Remove from local vehicles array
+                vehicles = vehicles.filter(v => v.currentStep !== 'Finished');
+                renderBoard();
+                console.log('✅ Cleared ' + finishedVehicles.length + ' vehicles from Finished bucket.');
+            } catch (e) {
+                console.error('clearFinishedBucket error:', e.message);
+                alert('⚠️ Error clearing Finished bucket: ' + e.message);
+            }
+        }
+
         // ── Save a note to Supabase vehicle_notes table ──────────────────
         async function saveNoteToSupabase(vehicle, noteText, user) {
             if (!supabaseClient || !vehicle.id) return;
@@ -2154,9 +2184,10 @@
             }).length;
 
             // Filter vehicles based on selected stat
-            let vehiclesToShow = vehicles;
+            // COMPLETED vehicles are hidden from the board (cleared from Finished bucket)
+            let vehiclesToShow = vehicles.filter(v => v.workflow !== 'COMPLETED');
             if (selectedStatFilter !== 'all') {
-                vehiclesToShow = getVehiclesByStat(selectedStatFilter);
+                vehiclesToShow = getVehiclesByStat(selectedStatFilter).filter(v => v.workflow !== 'COMPLETED');
             }
 
             // Filter by workflow
@@ -2295,6 +2326,19 @@
                             <div class="queue-header">
                                 <span class="queue-title">${step}</span>
                                 <span class="queue-count">${stepVehicles.length}</span>
+                                ${step === 'Finished' && canManageTags() && stepVehicles.length > 0 ? `
+                                <button onclick="clearFinishedBucket()" style="
+                                    background: #c53030;
+                                    color: white;
+                                    border: none;
+                                    border-radius: 6px;
+                                    padding: 4px 10px;
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    cursor: pointer;
+                                    letter-spacing: 0.03em;
+                                    margin-left: auto;
+                                ">🗑️ Clear All</button>` : ''}
                             </div>
                             ${hasOverdue ? `
                                 <div class="overdue-alert">
@@ -6029,6 +6073,20 @@ ${baseDirectory}/
                             </div>
                             <div><strong>Photos:</strong> ${vehicle.photos?.length || 0}</div>
                             <div><strong>Notes:</strong> ${(vehicle.noteHistory || []).length}</div>
+                            <div style="grid-column: span 3; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                                <strong>Change Workflow:</strong>
+                                <select id="workflow_${vehicle.vin}"
+                                    style="flex:1; min-width:160px; padding:4px 8px; border:2px solid #805ad5; border-radius:5px; font-size:12px; font-weight:600; color:#2d3748; cursor:pointer;">
+                                    <option value="${vehicle.workflow || ''}" selected>📋 ${workflows[vehicle.workflow]?.name || vehicle.workflow || 'None'}</option>
+                                    ${Object.entries(workflows).filter(([id]) => id !== vehicle.workflow).map(([id, wf]) =>
+                                        '<option value="' + id + '">' + wf.name + '</option>'
+                                    ).join('')}
+                                </select>
+                                <button onclick="assignWorkflowToVehicle('${vehicle.vin}')"
+                                    style="padding:4px 12px; background:#805ad5; color:white; border:none; border-radius:5px; font-size:12px; font-weight:700; cursor:pointer; white-space:nowrap;">
+                                    Apply
+                                </button>
+                            </div>
                         </div>
                         
                         ${vehicle.appraisalNotes ? `
