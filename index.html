@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Vehicle Recon Management System</title>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.js"></script>
     <style>
         * {
             margin: 0;
@@ -629,18 +628,8 @@
         }
         
         .vehicle-card.needs-attention {
-            animation: pulseAttention 2s ease-in-out infinite;
-        }
-        
-        @keyframes pulseAttention {
-            0%, 100% {
-                border-color: #f39c12;
-                box-shadow: 0 0 0 0 rgba(243, 156, 18, 0.4);
-            }
-            50% {
-                border-color: #e67e22;
-                box-shadow: 0 0 0 6px rgba(243, 156, 18, 0);
-            }
+            border-color: #f39c12;
+            border-left: 4px solid #f39c12;
         }
 
         .vehicle-vin {
@@ -1089,16 +1078,21 @@
                     noteHistory: []
                 }));
                 
-                // Load all notes in a single query (fixes N+1 performance issue)
+                // Load all notes in chunked queries to avoid URL-length limits on large fleets
                 if (vehicles.length > 0) {
                     const vehicleIds = vehicles.map(v => v.id);
-                    const { data: allNotes } = await supabaseClient
-                        .from('vehicle_notes')
-                        .select('*')
-                        .in('vehicle_id', vehicleIds)
-                        .order('created_at', { ascending: false });
+                    const CHUNK = 100;
+                    let allNotes = [];
+                    for (let i = 0; i < vehicleIds.length; i += CHUNK) {
+                        const { data } = await supabaseClient
+                            .from('vehicle_notes')
+                            .select('*')
+                            .in('vehicle_id', vehicleIds.slice(i, i + CHUNK))
+                            .order('created_at', { ascending: false });
+                        if (data) allNotes = allNotes.concat(data);
+                    }
                     
-                    if (allNotes) {
+                    if (allNotes.length > 0) {
                         // Group notes by vehicle_id
                         const notesByVehicle = {};
                         for (const n of allNotes) {
@@ -1116,8 +1110,7 @@
                         }
                     }
                 }
-                // Rebuild scan cache after vehicles + notes are loaded
-                buildScanCache();
+
             }
         }
         
@@ -1664,6 +1657,10 @@
         function isAdmin() {
             return currentUser && (currentUser.role === 'administrator' || currentUser.role === 'superadmin');
         }
+
+        function canManageTags() {
+            return currentUser && (currentUser.role === 'manager' || currentUser.role === 'administrator' || currentUser.role === 'superadmin');
+        }
         
         function formatTimeDiff(date) {
             const diff = Date.now() - date.getTime();
@@ -1886,7 +1883,17 @@
                         assigned_tech:    vehicle.assignedTech,
                         completed_steps:  vehicle.completedSteps,
                         skipped_steps:    vehicle.skippedSteps,
-                        workflow:         vehicle.workflow
+                        workflow:         vehicle.workflow,
+                        step_history:     vehicle.stepHistory || [],
+                        tags:             vehicle.tags || [],
+                        vehicle_tags:     vehicle.vehicleTags || [],
+                        photos:           (vehicle.photos || []).map(p => ({
+                            name:       p.name,
+                            filename:   p.filename,
+                            data:       p.data || null,
+                            uploadedAt: p.uploadedAt instanceof Date ? p.uploadedAt.toISOString() : p.uploadedAt,
+                            uploadedBy: p.uploadedBy
+                        }))
                     })
                     .eq('id', vehicle.id)
                     .select('id');
@@ -1905,15 +1912,33 @@
             }
         }
 
+        // ── Save a note to Supabase vehicle_notes table ──────────────────
+        async function saveNoteToSupabase(vehicle, noteText, user) {
+            if (!supabaseClient || !vehicle.id) return;
+            try {
+                await supabaseClient.from('vehicle_notes').insert({
+                    vehicle_id:  vehicle.id,
+                    note_text:   noteText,
+                    username:    user || (currentUser ? currentUser.username : 'Unknown'),
+                    created_at:  new Date().toISOString()
+                });
+            } catch (e) {
+                console.warn('saveNoteToSupabase failed:', e.message);
+            }
+        }
+
         async function completeStep(vehicle) {
+            const completedStepName = vehicle.currentStep;
+            const tech = vehicle.assignedTech;
+
             // Mark current step as complete
-            vehicle.completedSteps.push(vehicle.currentStep);
+            vehicle.completedSteps.push(completedStepName);
             
             // Update technician status - they're now available
-            if (vehicle.assignedTech && technicianStatus[vehicle.assignedTech]) {
-                technicianStatus[vehicle.assignedTech].available = true;
-                technicianStatus[vehicle.assignedTech].currentVehicle = null;
-                technicianStatus[vehicle.assignedTech].lastCompleted = Date.now();
+            if (tech && technicianStatus[tech]) {
+                technicianStatus[tech].available = true;
+                technicianStatus[tech].currentVehicle = null;
+                technicianStatus[tech].lastCompleted = Date.now();
             }
             
             // Determine next step using smart routing with safety checks
@@ -1944,6 +1969,23 @@
             vehicle.stepStartTime = new Date();
             const newTech = assignTechnician(nextStep);
             vehicle.assignedTech = newTech;
+
+            // Record step transition in stepHistory
+            if (!vehicle.stepHistory) vehicle.stepHistory = [];
+            vehicle.stepHistory.push({
+                step:      completedStepName,
+                status:    'completed',
+                tech:      tech || 'Unassigned',
+                movedTo:   nextStep,
+                timestamp: new Date().toISOString(),
+                user:      currentUser ? currentUser.username : 'Unknown'
+            });
+
+            // Save a note recording the transition
+            const _stepNote = `✅ ${completedStepName} completed by ${tech || 'Unassigned'} → moved to ${nextStep}`;
+            if (!vehicle.noteHistory) vehicle.noteHistory = [];
+            vehicle.noteHistory.push({ text: _stepNote, timestamp: new Date(), user: currentUser ? currentUser.username : 'Unknown', id: Date.now() + Math.random() });
+            await saveNoteToSupabase(vehicle, _stepNote);
             
             // Update new technician status
             if (newTech && technicianStatus[newTech]) {
@@ -1965,6 +2007,21 @@
             vehicle.currentStep = sendBackTo;
             vehicle.stepStartTime = new Date();
             vehicle.assignedTech = assignTechnician(sendBackTo);
+
+            // Record QC rejection in stepHistory and notes
+            if (!vehicle.stepHistory) vehicle.stepHistory = [];
+            vehicle.stepHistory.push({
+                step:      'Quality Control',
+                status:    'rejected',
+                tech:      vehicle.assignedTech || 'Unassigned',
+                movedTo:   sendBackTo,
+                timestamp: new Date().toISOString(),
+                user:      currentUser ? currentUser.username : 'Unknown'
+            });
+            const _qcNote = `❌ QC Rejected — sent back to ${sendBackTo}`;
+            if (!vehicle.noteHistory) vehicle.noteHistory = [];
+            vehicle.noteHistory.push({ text: _qcNote, timestamp: new Date(), user: currentUser ? currentUser.username : 'Unknown', id: Date.now() + Math.random() });
+            await saveNoteToSupabase(vehicle, _qcNote);
 
             await persistVehicleState(vehicle);
             render();
@@ -2030,6 +2087,15 @@
     
 </div>
                         <button class="logout-btn" onclick="logout()">Logout</button>
+                        <button onclick="toggleNotificationPanel()" id="notifBell"
+                            style="position:relative;background:none;border:none;cursor:pointer;font-size:22px;padding:4px 8px;border-radius:6px;transition:background 0.2s;"
+                            title="Inventory Notifications">
+                            🔔
+                            <span id="notifBadge" style="display:none;position:absolute;top:0;right:0;
+                                background:#e53e3e;color:white;border-radius:50%;
+                                width:18px;height:18px;font-size:10px;font-weight:800;
+                                display:flex;align-items:center;justify-content:center;line-height:1;">0</span>
+                        </button>
                     </div>
                 </header>
             `;
@@ -2259,7 +2325,7 @@
                                             <div>
                                                 <div class="vehicle-vin">${vehicle.stockNumber || vehicle.vin}</div>
                                                 ${vehicle.year && vehicle.make && vehicle.model ? `
-                                                    <div style="font-size: 11px; color: #718096; margin-top: 2px;">
+                                                    <div style="font-size: 11px; color: #718096; margin-top: 1px;">
                                                         ${vehicle.year} ${vehicle.make} ${vehicle.model}
                                                     </div>
                                                 ` : ''}
@@ -2275,9 +2341,11 @@
                                                 ` : ''}
                                             </div>
                                         </div>
-                                        <div class="vehicle-time">⏱️ ${formatTimeDiff(vehicle.stepStartTime)} in step</div>
-                                        <div class="vehicle-time">📅 ${formatTimeDiff(vehicle.entryTime)} in system</div>
-                                        <div class="vehicle-time">👤 ${vehicle.assignedTech || 'Unassigned'}</div>
+                                        <div class="vehicle-time" style="margin-top:5px;">
+                                            👤 ${vehicle.assignedTech || 'Unassigned'}
+                                            &nbsp;·&nbsp; ⏱️ ${formatTimeDiff(vehicle.stepStartTime)}
+                                            ${(showStepSuggestion || showTechSuggestion) ? '&nbsp;·&nbsp; <span style="color:#f39c12;font-weight:700;">⚡ Needs attention</span>' : ''}
+                                        </div>
                                         ${vehicle.tags.length > 0 ? `
                                             <div class="vehicle-tags">
                                                 ${vehicle.tags.map(tag => `<span class="tag">${tag}</span>`).join('')}
@@ -2290,27 +2358,9 @@
                                             </button>
                                         ` : ''}
                                         ${(currentUser && (currentUser.role === 'administrator' || currentUser.role === 'superadmin')) && vehicle.currentStep !== 'Finished' ? `
-                                            <button class="quick-complete-btn" onclick="event.stopPropagation(); pushToFinished('${vehicle.vin}')" style="background:#805ad5;margin-top:4px;">
+                                            <button class="quick-complete-btn" onclick="event.stopPropagation(); pushToFinished('${vehicle.vin}')" style="background:#c53030;margin-top:4px;font-weight:800;letter-spacing:0.03em;">
                                                 🏁 Push to Finished
                                             </button>
-                                        ` : ''}
-                                        ${showStepSuggestion ? `
-                                            <div class="step-suggestion" onclick="event.stopPropagation()">
-                                                <strong>🔄 Move to Different Step:</strong><br>
-                                                ${suggestedStep} has shorter queue
-                                                <button class="step-btn" onclick="event.stopPropagation(); moveToSuggestedStep('${vehicle.vin}', '${suggestedStep}')">
-                                                    Move to ${suggestedStep}
-                                                </button>
-                                            </div>
-                                        ` : ''}
-                                        ${showTechSuggestion ? `
-                                            <div class="reassign-suggestion" onclick="event.stopPropagation()">
-                                                <strong>💡 Reassign Technician:</strong><br>
-                                                ${availableTech} is available
-                                                <button class="reassign-btn" onclick="event.stopPropagation(); reassignVehicle('${vehicle.vin}', '${availableTech}')">
-                                                    Reassign to ${availableTech}
-                                                </button>
-                                            </div>
                                         ` : ''}
                                     </div>
                                 `}).join('')}
@@ -2549,21 +2599,21 @@
 
                 <div class="admin-content ${currentAdminTab === 'import' ? 'active' : ''}">
                     <div class="admin-section">
-                        <h2 class="section-title">📋 Import Vehicles from Excel</h2>
+                        <h2 class="section-title">📋 Import Vehicles</h2>
                         <div style="background: #f7fafc; padding: 15px; border-radius: 4px; margin-bottom: 15px;">
-                            <p style="margin-bottom: 10px; font-size: 14px;">
-                                Upload a CSV file with columns: VIN, Stock Number, Year, Make, Model, Miles, Appraisal Notes, Skip Steps
-                            </p>
+                            <p style="margin-bottom: 10px; font-size: 14px; font-weight: 600;">vAuto Export (.xls)</p>
                             <p style="margin-bottom: 10px; font-size: 13px; color: #718096;">
-                                <strong>Note:</strong> New vehicles are added · Existing stock numbers get year/make/model/miles updated (VIN &amp; stock are never changed)
+                                Drop your vAuto scheduled export here. Columns auto-detected: Stock #, VIN, Year, Make, Model, Odometer, New/Used, Color, Series, Inventory Date.<br>
+                                <strong>New vehicles are added · Existing stock numbers get year/make/model/miles updated</strong>
                             </p>
-                            <input type="file" id="excelImport" accept=".csv" 
+                            <input type="file" id="excelImport" accept=".xls,.xlsx,.csv"
                                    onchange="handleExcelImport(event)"
-                                   style="width: 100%; padding: 10px; border: 1px solid #cbd5e0; border-radius: 4px; font-size: 14px;">
-                            <button class="btn" onclick="downloadImportTemplate()" 
-                                    style="margin-top: 10px; background: #4299e1;">
-                                📥 Download Template
-                            </button>
+                                   style="width: 100%; padding: 10px; border: 2px dashed #4299e1; border-radius: 6px; font-size: 14px; background: white; cursor: pointer;">
+                            <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap;">
+                                <button class="btn" onclick="downloadImportTemplate()" style="background: #718096;">
+                                    📥 Download Legacy Template
+                                </button>
+                            </div>
                         </div>
                     </div>
 
@@ -3251,6 +3301,7 @@
                 
                 // Load data for current location
                 await loadDataFromSupabase();
+                await loadNotifications();
                 render();
                 
             } catch (err) {
@@ -3328,22 +3379,37 @@
                 
                 // Load workflows, technicians, step thresholds, tag definitions, and notes all in parallel
                 const vehicleIds = vehicles.map(v => v.id);
+
+                // Helper: fetch notes in chunks of 100 to avoid URL-length limits on large fleets (343+ vehicles)
+                async function fetchNotesByVehicleIds(ids) {
+                    if (!ids || ids.length === 0) return [];
+                    const CHUNK = 100;
+                    let rows = [];
+                    for (let i = 0; i < ids.length; i += CHUNK) {
+                        const { data } = await supabaseClient
+                            .from('vehicle_notes')
+                            .select('*')
+                            .in('vehicle_id', ids.slice(i, i + CHUNK))
+                            .order('created_at', { ascending: false });
+                        if (data) rows = rows.concat(data);
+                    }
+                    return rows;
+                }
+
                 const [
                     { data: workflowData },
                     { data: techData,        error: techErr },
                     { data: profileTechData, error: profileTechErr },
                     { data: thresholdData },
                     { data: tagData },
-                    { data: allNotes }
+                    allNotes
                 ] = await Promise.all([
                     supabaseClient.from('workflows').select('*').eq('location_id', currentLocationId),
                     supabaseClient.from('technicians').select('*').eq('location_id', currentLocationId),
                     supabaseClient.from('user_profiles').select('full_name, department').eq('location_id', currentLocationId).eq('role', 'technician'),
                     supabaseClient.from('step_thresholds').select('*').eq('location_id', currentLocationId),
                     supabaseClient.from('tag_definitions').select('*').eq('location_id', currentLocationId),
-                    vehicleIds.length > 0
-                        ? supabaseClient.from('vehicle_notes').select('*').in('vehicle_id', vehicleIds).order('created_at', { ascending: false })
-                        : Promise.resolve({ data: [] })
+                    fetchNotesByVehicleIds(vehicleIds)
                 ]);
 
                 console.log('📋 techData:', JSON.stringify(techData), '| error:', techErr?.message);
@@ -3435,6 +3501,35 @@
                         vehicle.noteHistory = notesByVehicle[vehicle.id] || [];
                     }
                 }
+
+                // Load vehicle history from Supabase
+                try {
+                    const { data: historyData } = await supabaseClient
+                        .from('vehicle_history')
+                        .select('*')
+                        .eq('location_id', currentLocationId)
+                        .order('completed_date', { ascending: false })
+                        .limit(500);
+                    if (historyData && historyData.length > 0) {
+                        vehicleHistory = historyData.map(h => ({
+                            vin:            h.vin,
+                            stockNumber:    h.stock_number,
+                            miles:          h.miles,
+                            appraisalNotes: h.appraisal_notes,
+                            completedDate:  new Date(h.completed_date),
+                            totalReconTime: h.total_recon_time,
+                            notes:          h.notes || '',
+                            noteHistory:    h.note_history || [],
+                            stepHistory:    h.step_history || [],
+                            photos:         h.photos || [],
+                            workflow:       h.workflow
+                        }));
+                        console.log(`✅ Loaded ${vehicleHistory.length} history records`);
+                    }
+                } catch(he) {
+                    // vehicle_history table may not exist yet — that's OK
+                    console.warn('vehicle_history table not found (run migrations to enable):', he.message);
+                }
                 
             } catch (err) {
                 console.error('Error loading data:', err);
@@ -3454,6 +3549,7 @@
             console.log('📍 Now viewing:', selectedLocation?.name);
             
             await loadDataFromSupabase();
+            await loadNotifications();
             render();
 
             // If user management tab is open, reload it for the new location
@@ -4664,7 +4760,7 @@
             }
         }
 
-        function addTagToVehicle(vin, tagName) {
+        async function addTagToVehicle(vin, tagName) {
             const vehicle = vehicles.find(v => v.vin === vin);
             if (!vehicle) return;
 
@@ -4690,18 +4786,16 @@
 
             // Add to note history
             if (!vehicle.noteHistory) vehicle.noteHistory = [];
-            vehicle.noteHistory.push({
-                text: `Tag added: ${tagName}`,
-                timestamp: new Date(),
-                user: currentUser ? currentUser.username : 'Unknown',
-                id: Date.now() + Math.random()
-            });
+            const _tagAddNote = `Tag added: ${tagName}`;
+            vehicle.noteHistory.push({ text: _tagAddNote, timestamp: new Date(), user: currentUser ? currentUser.username : 'Unknown', id: Date.now() + Math.random() });
+            await saveNoteToSupabase(vehicle, _tagAddNote);
 
+            await persistVehicleState(vehicle);
             render();
             alert(`✓ Tag "${tagName}" added`);
         }
 
-        function removeTagFromVehicle(vin, tagName) {
+        async function removeTagFromVehicle(vin, tagName) {
             const vehicle = vehicles.find(v => v.vin === vin);
             if (!vehicle) return;
 
@@ -4716,13 +4810,11 @@
 
             // Add to note history
             if (!vehicle.noteHistory) vehicle.noteHistory = [];
-            vehicle.noteHistory.push({
-                text: `Tag removed: ${tagName}`,
-                timestamp: new Date(),
-                user: currentUser ? currentUser.username : 'Unknown',
-                id: Date.now() + Math.random()
-            });
+            const _tagRmNote = `Tag removed: ${tagName}`;
+            vehicle.noteHistory.push({ text: _tagRmNote, timestamp: new Date(), user: currentUser ? currentUser.username : 'Unknown', id: Date.now() + Math.random() });
+            await saveNoteToSupabase(vehicle, _tagRmNote);
 
+            await persistVehicleState(vehicle);
             render();
         }
 
@@ -5279,12 +5371,9 @@
             
             // Add note to history
             if (!vehicle.noteHistory) vehicle.noteHistory = [];
-            vehicle.noteHistory.push({
-                text: `Workflow assigned: ${workflow.name}. Started in ${firstStep || 'N/A'}. Tech: ${vehicle.assignedTech}`,
-                timestamp: new Date(),
-                user: currentUser ? currentUser.username : 'Unknown',
-                id: Date.now() + Math.random()
-            });
+            const _wfNote = `Workflow assigned: ${workflow.name}. Started in ${firstStep || 'N/A'}. Tech: ${vehicle.assignedTech}`;
+            vehicle.noteHistory.push({ text: _wfNote, timestamp: new Date(), user: currentUser ? currentUser.username : 'Unknown', id: Date.now() + Math.random() });
+            await saveNoteToSupabase(vehicle, _wfNote);
 
             // Persist to Supabase
             if (supabaseClient && vehicle.id) {
@@ -5355,12 +5444,9 @@
                 }
 
                 if (!vehicle.noteHistory) vehicle.noteHistory = [];
-                vehicle.noteHistory.push({
-                    text: `[Bulk Assign] Workflow: ${workflow.name}. Step: ${firstStep}. Tech: ${vehicle.assignedTech}`,
-                    timestamp: new Date(),
-                    user: currentUser ? currentUser.username : 'Unknown',
-                    id: Date.now() + Math.random()
-                });
+                const _baNote = `[Bulk Assign] Workflow: ${workflow.name}. Step: ${firstStep}. Tech: ${vehicle.assignedTech}`;
+                vehicle.noteHistory.push({ text: _baNote, timestamp: new Date(), user: currentUser ? currentUser.username : 'Unknown', id: Date.now() + Math.random() });
+                await saveNoteToSupabase(vehicle, _baNote);
 
                 // Persist to Supabase
                 if (supabaseClient && vehicle.id) {
@@ -5623,36 +5709,55 @@ ${baseDirectory}/
             }
         }
 
-        function saveVehicleToHistory(vehicle) {
+        async function saveVehicleToHistory(vehicle) {
             const completedDate = new Date();
-            const year = completedDate.getFullYear();
-            const month = String(completedDate.getMonth() + 1).padStart(2, '0');
-            
+            const totalMinutes = Math.floor((completedDate - vehicle.entryTime) / (1000 * 60));
+            const totalReconTime = totalMinutes < 60
+                ? `${totalMinutes}m`
+                : totalMinutes < 1440
+                    ? `${Math.floor(totalMinutes/60)}h ${totalMinutes%60}m`
+                    : `${Math.floor(totalMinutes/1440)}d ${Math.floor((totalMinutes%1440)/60)}h`;
+
             const historyRecord = {
-                vin: vehicle.vin,
-                stockNumber: vehicle.stockNumber,
-                miles: vehicle.miles,
+                vin:            vehicle.vin,
+                stockNumber:    vehicle.stockNumber,
+                miles:          vehicle.miles,
                 appraisalNotes: vehicle.appraisalNotes,
-                completedDate: completedDate,
-                totalReconTime: Math.floor((completedDate - vehicle.entryTime) / (1000 * 60)), // minutes
-                notes: vehicle.notes,
-                noteHistory: vehicle.noteHistory || [], // Preserve note history
-                photos: vehicle.photos,
-                stepHistory: vehicle.stepHistory
+                completedDate:  completedDate,
+                totalReconTime: totalReconTime,
+                notes:          vehicle.notes,
+                noteHistory:    vehicle.noteHistory || [],
+                photos:         vehicle.photos || [],
+                stepHistory:    vehicle.stepHistory || []
             };
 
             // Add to in-memory history
             vehicleHistory.push(historyRecord);
 
-            // Simulate file save
-            const filename = `${vehicle.stockNumber}_completed_${completedDate.toISOString().split('T')[0].replace(/-/g, '')}.json`;
-            const filepath = `${historyDirectory}/${year}/${month}/${filename}`;
-            
-            console.log(`Saving vehicle history to: ${filepath}`);
-            console.log(JSON.stringify(historyRecord, null, 2));
-
-            // In production, would use:
-            // await fetch('/api/save-history', { method: 'POST', body: JSON.stringify(historyRecord) });
+            // Persist to Supabase vehicle_history table
+            if (supabaseClient && currentLocationId) {
+                try {
+                    await supabaseClient.from('vehicle_history').insert({
+                        location_id:     currentLocationId,
+                        vin:             vehicle.vin,
+                        stock_number:    vehicle.stockNumber,
+                        year:            vehicle.year,
+                        make:            vehicle.make,
+                        model:           vehicle.model,
+                        miles:           vehicle.miles,
+                        completed_date:  completedDate.toISOString(),
+                        total_recon_time: totalReconTime,
+                        total_minutes:   totalMinutes,
+                        note_history:    vehicle.noteHistory || [],
+                        step_history:    vehicle.stepHistory || [],
+                        photos:          (vehicle.photos || []).map(p => ({ name: p.name, filename: p.filename, url: p.url || null, uploadedBy: p.uploadedBy })),
+                        workflow:        vehicle.workflow
+                    });
+                    console.log('✅ Vehicle history saved to Supabase:', vehicle.stockNumber);
+                } catch(e) {
+                    console.warn('Failed to save vehicle history to Supabase:', e.message);
+                }
+            }
         }
 
         function savePhotoToFileSystem(vehicle, photoData, filename) {
@@ -5690,22 +5795,102 @@ ${baseDirectory}/
             return { inStep, movable, overdue };
         }
 
-        async function pushToFinished(vin) {
+        function pushToFinished(vin) {
             const vehicle = vehicles.find(v => v.vin === vin);
             if (!vehicle) return;
-            if (!confirm('Push ' + (vehicle.stockNumber || vin) + ' directly to Finished?\n\nThis will skip any incomplete steps. Administrator action.')) return;
+
+            // Remove any existing modal
+            const existing = document.getElementById('pushFinishedModal');
+            if (existing) existing.remove();
+
+            const modal = document.createElement('div');
+            modal.id = 'pushFinishedModal';
+            modal.style.cssText = `
+                position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9000;
+                display:flex;align-items:center;justify-content:center;padding:20px;
+            `;
+            modal.innerHTML = `
+                <div style="background:white;border-radius:12px;padding:28px;max-width:380px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,0.3);">
+                    <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+                        <span style="font-size:22px;">🏁</span>
+                        <h3 style="color:#c53030;font-size:17px;font-weight:800;">Push to Finished</h3>
+                    </div>
+                    <p style="color:#4a5568;font-size:13px;margin-bottom:4px;">
+                        <strong>${vehicle.stockNumber || vin}</strong> — ${vehicle.year || ''} ${vehicle.make || ''} ${vehicle.model || ''}
+                    </p>
+                    <p style="color:#718096;font-size:12px;margin-bottom:18px;">
+                        This will skip all incomplete steps. Enter your password to confirm.
+                    </p>
+                    <label style="display:block;font-size:12px;font-weight:700;color:#4a5568;margin-bottom:6px;">Your Password</label>
+                    <input type="password" id="pushFinishedPassword" placeholder="••••••••"
+                        style="width:100%;padding:10px;border:2px solid #e2e8f0;border-radius:8px;font-size:14px;margin-bottom:6px;"
+                        onkeydown="if(event.key==='Enter') confirmPushToFinished('${vin}')">
+                    <div id="pushFinishedError" style="color:#c53030;font-size:12px;min-height:18px;margin-bottom:12px;"></div>
+                    <div style="display:flex;gap:10px;">
+                        <button onclick="document.getElementById('pushFinishedModal').remove();"
+                            style="flex:1;padding:10px;background:#edf2f7;color:#4a5568;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;">
+                            Cancel
+                        </button>
+                        <button onclick="confirmPushToFinished('${vin}')"
+                            style="flex:1;padding:10px;background:#c53030;color:white;border:none;border-radius:8px;font-size:14px;font-weight:800;cursor:pointer;">
+                            Confirm
+                        </button>
+                    </div>
+                </div>
+            `;
+            modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+            document.body.appendChild(modal);
+            setTimeout(() => document.getElementById('pushFinishedPassword')?.focus(), 50);
+        }
+
+        async function confirmPushToFinished(vin) {
+            const vehicle = vehicles.find(v => v.vin === vin);
+            if (!vehicle) return;
+
+            const input = document.getElementById('pushFinishedPassword');
+            const errorEl = document.getElementById('pushFinishedError');
+            const enteredPassword = input ? input.value : '';
+
+            // Verify password against current user
+            let passwordValid = false;
+            if (supabaseClient && currentUser && currentUser.email) {
+                try {
+                    const { error } = await supabaseClient.auth.signInWithPassword({
+                        email: currentUser.email,
+                        password: enteredPassword
+                    });
+                    passwordValid = !error;
+                } catch(e) {
+                    passwordValid = false;
+                }
+            }
+            // Fallback: mock users
+            if (!passwordValid && currentUser && currentUser.username) {
+                const mockUsers = {
+                    'admin': 'admin123',
+                    'mike': 'tech123',
+                    'sarah': 'tech123',
+                    'tom': 'tech123'
+                };
+                passwordValid = mockUsers[currentUser.username] === enteredPassword;
+            }
+
+            if (!passwordValid) {
+                if (errorEl) errorEl.textContent = '❌ Incorrect password. Try again.';
+                if (input) { input.value = ''; input.focus(); }
+                return;
+            }
+
+            document.getElementById('pushFinishedModal')?.remove();
 
             vehicle.currentStep = 'Finished';
             vehicle.stepStartTime = new Date();
             vehicle.assignedTech = null;
 
             if (!vehicle.noteHistory) vehicle.noteHistory = [];
-            vehicle.noteHistory.push({
-                text: 'Manually pushed to Finished by ' + (currentUser ? currentUser.name : 'Admin') + ' (steps bypassed)',
-                timestamp: new Date(),
-                user: currentUser ? currentUser.username : 'admin',
-                id: Date.now() + Math.random()
-            });
+            const _ffNote = 'Manually pushed to Finished by ' + (currentUser ? currentUser.name : 'Admin') + ' (steps bypassed)';
+            vehicle.noteHistory.push({ text: _ffNote, timestamp: new Date(), user: currentUser ? currentUser.username : 'admin', id: Date.now() + Math.random() });
+            await saveNoteToSupabase(vehicle, _ffNote);
 
             await persistVehicleState(vehicle);
             render();
@@ -5729,7 +5914,7 @@ ${baseDirectory}/
             }
         }
 
-        function showVehicleDetails(vin) {
+        function showVehicleDetails(vin, defaultTab) {
             const vehicle = vehicles.find(v => v.vin === vin);
             if (!vehicle) return;
 
@@ -5755,7 +5940,11 @@ ${baseDirectory}/
 
             // Admin has full control
             if (isAdmin()) {
-                showAdminVehicleDialog(vehicle);
+                // Compute suggestions to pass into dialog
+                const suggestedStep = getSuggestedAlternateStep(vehicle);
+                const availableTech = getAvailableTechnician(vehicle.currentStep);
+                const suggestableTech = (availableTech && availableTech !== vehicle.assignedTech) ? availableTech : null;
+                showAdminVehicleDialog(vehicle, suggestedStep, suggestableTech, defaultTab);
             }
         }
 
@@ -5792,7 +5981,7 @@ ${baseDirectory}/
             return html;
         }
 
-        function showAdminVehicleDialog(vehicle) {
+        function showAdminVehicleDialog(vehicle, suggestedStep, suggestableTech, defaultTab) {
             const dialogHTML = `
                 <div id="vehicleDialog" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px;">
                     <div style="background: white; border-radius: 8px; padding: 20px; max-width: 1100px; width: 100%; max-height: 85vh; overflow-y: auto;">
@@ -5848,6 +6037,32 @@ ${baseDirectory}/
                                 ${vehicle.appraisalNotes}
                             </div>
                         ` : ''}
+
+                        ${(suggestedStep || suggestableTech) ? `
+                            <div style="margin-bottom:15px;padding:12px 14px;background:#fffaf0;border:2px solid #f39c12;border-radius:6px;font-size:12px;">
+                                <div style="font-weight:700;color:#b7791f;margin-bottom:8px;">⚡ Attention Needed</div>
+                                <div style="display:flex;flex-wrap:wrap;gap:8px;">
+                                    ${suggestedStep ? `
+                                        <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:200px;">
+                                            <span style="color:#4a5568;">🔄 <strong>${suggestedStep}</strong> has a shorter queue</span>
+                                            <button onclick="closeDialog();moveToSuggestedStep('${vehicle.vin}','${suggestedStep}')"
+                                                style="padding:4px 10px;background:#805ad5;color:white;border:none;border-radius:4px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;">
+                                                Move there
+                                            </button>
+                                        </div>
+                                    ` : ''}
+                                    ${suggestableTech ? `
+                                        <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:200px;">
+                                            <span style="color:#4a5568;">💡 <strong>${suggestableTech}</strong> is available</span>
+                                            <button onclick="closeDialog();reassignVehicle('${vehicle.vin}','${suggestableTech}')"
+                                                style="padding:4px 10px;background:#f39c12;color:white;border:none;border-radius:4px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;">
+                                                Reassign
+                                            </button>
+                                        </div>
+                                    ` : ''}
+                                </div>
+                            </div>
+                        ` : ''}
                         
                         <div style="margin-bottom: 15px; font-size: 12px;">
                             <strong>Completed:</strong> ${vehicle.completedSteps.join(', ') || 'None'}<br>
@@ -5878,11 +6093,6 @@ ${baseDirectory}/
                                     📜 History
                                 </button>
                             ` : ''}
-                            <button onclick="switchVehicleTab('${vehicle.vin}', 'move')" 
-                                    class="action-tab-btn" id="btn_move_${vehicle.vin}"
-                                    style="flex: 1; min-width: 140px; padding: 12px 16px; background: white; border: 2px solid #e2e8f0; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.2s; color: #2d3748;">
-                                🚗 Move
-                            </button>
                             ${vehicle.currentStep !== 'Finished' ? `
                                 <button onclick="switchVehicleTab('${vehicle.vin}', 'complete')" 
                                         class="action-tab-btn" id="btn_complete_${vehicle.vin}"
@@ -5986,18 +6196,42 @@ ${baseDirectory}/
                         
                         <!-- Photos Tab -->
                         <div id="tab_photos_${vehicle.vin}" class="tab-content" style="display: none;">
-                            <h3 style="margin-bottom: 15px; font-size: 15px;">📷 Upload Photos</h3>
+                            <h3 style="margin-bottom: 15px; font-size: 15px;">📷 Photos</h3>
                             <input type="file" id="photoUpload_${vehicle.vin}" accept="image/*" multiple 
                                    onchange="handlePhotoUpload('${vehicle.vin}', event)"
-                                   style="width: 100%; padding: 15px; border: 3px dashed #cbd5e0; border-radius: 6px; font-size: 13px; background: #f7fafc; cursor: pointer;">
+                                   style="width: 100%; padding: 15px; border: 3px dashed #cbd5e0; border-radius: 6px; font-size: 13px; background: #f7fafc; cursor: pointer; margin-bottom: 15px;">
                             ${vehicle.photos && vehicle.photos.length > 0 ? `
-                                <div style="margin-top: 15px; padding: 15px; background: #f7fafc; border-radius: 6px;">
-                                    <strong style="font-size: 13px;">Uploaded Photos:</strong>
-                                    <div style="margin-top: 10px; font-size: 13px; color: #4a5568;">
-                                        ${vehicle.photos.length} photo(s) uploaded
+                                <div style="margin-top: 10px;">
+                                    <strong style="font-size: 13px; display: block; margin-bottom: 10px;">${vehicle.photos.length} Photo(s):</strong>
+                                    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px;">
+                                        ${vehicle.photos.map((p, idx) => {
+                                            const src   = p.data || null;
+                                            const label = p.name || ('Photo ' + (idx + 1));
+                                            const canDelete = currentUser && currentUser.role === 'superadmin';
+                                            return src
+                                                ? `<div style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,0.08);position:relative;">
+                                                       ${canDelete ? `
+                                                       <button onclick="event.stopPropagation();deleteVehiclePhoto('${vehicle.vin}',${idx})"
+                                                               style="position:absolute;top:5px;right:5px;z-index:10;background:rgba(229,62,62,0.85);border:none;color:#fff;border-radius:50%;width:24px;height:24px;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1;backdrop-filter:blur(2px);" title="Delete photo">✕</button>` : ''}
+                                                       <div style="cursor:pointer;" onclick="openPhotoLightbox('${src}','${label}')">
+                                                           <img src="${src}" alt="${label}" style="width:100%;height:130px;object-fit:cover;display:block;">
+                                                           <div style="padding:6px 8px;">
+                                                               <div style="font-size:11px;color:#4a5568;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${label}">📷 ${label}</div>
+                                                               <div style="font-size:10px;color:#a0aec0;">${p.uploadedBy || ''}</div>
+                                                           </div>
+                                                       </div>
+                                                   </div>`
+                                                : `<div style="border:1px solid #e2e8f0;border-radius:8px;padding:20px;background:#f7fafc;text-align:center;position:relative;">
+                                                       ${canDelete ? `
+                                                       <button onclick="deleteVehiclePhoto('${vehicle.vin}',${idx})"
+                                                               style="position:absolute;top:5px;right:5px;background:rgba(229,62,62,0.85);border:none;color:#fff;border-radius:50%;width:24px;height:24px;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1;" title="Delete photo">✕</button>` : ''}
+                                                       <div style="font-size:32px;">📷</div>
+                                                       <div style="font-size:11px;color:#718096;margin-top:6px;">${label}</div>
+                                                   </div>`;
+                                        }).join('')}
                                     </div>
                                 </div>
-                            ` : ''}
+                            ` : '<div style="padding:20px;text-align:center;color:#a0aec0;font-size:13px;">No photos yet</div>'}
                         </div>
                         
                         <!-- Tags Tab -->
@@ -6008,10 +6242,11 @@ ${baseDirectory}/
                                 ${(vehicle.vehicleTags || []).map(tag => `
                                     <span style="display: inline-flex; align-items: center; background: ${tagDefinitions[tag]?.color || '#bee3f8'}; margin: 5px; padding: 8px 12px; border-radius: 6px; font-size: 12px;">
                                         ${tag}
+                                        ${canManageTags() ? `
                                         <button onclick="removeTagFromVehicle('${vehicle.vin}', '${tag}'); closeDialog(); showVehicleDetails('${vehicle.vin}');" 
                                                 style="margin-left: 8px; background: none; border: none; color: #e53e3e; cursor: pointer; font-weight: bold; font-size: 14px; padding: 0; line-height: 1;">
                                             ✕
-                                        </button>
+                                        </button>` : ''}
                                     </span>
                                 `).join('')}
                                 ${(vehicle.vehicleTags || []).length === 0 ? '<div style="color: #a0aec0; font-size: 13px; padding: 10px;">No tags applied</div>' : ''}
@@ -6114,6 +6349,10 @@ ${baseDirectory}/
             `;
             
             document.body.insertAdjacentHTML('beforeend', dialogHTML);
+            // Auto-switch to a specific tab if requested (e.g. after photo upload)
+            if (defaultTab) {
+                setTimeout(() => switchVehicleTab(vehicle.vin, defaultTab), 0);
+            }
         }
         
         function switchVehicleTab(vin, tab) {
@@ -6161,12 +6400,9 @@ ${baseDirectory}/
             vehicle.stepStartTime = new Date(); // reset timer on reassign
 
             if (!vehicle.noteHistory) vehicle.noteHistory = [];
-            vehicle.noteHistory.push({
-                text: 'Tech changed to ' + (newTech || 'Unassigned'),
-                timestamp: new Date(),
-                user: currentUser ? currentUser.username : 'Unknown',
-                id: Date.now() + Math.random()
-            });
+            const _techNote = 'Tech changed to ' + (newTech || 'Unassigned');
+            vehicle.noteHistory.push({ text: _techNote, timestamp: new Date(), user: currentUser ? currentUser.username : 'Unknown', id: Date.now() + Math.random() });
+            await saveNoteToSupabase(vehicle, _techNote);
 
             await persistVehicleState(vehicle);
             // Refresh the select to reflect saved state without closing dialog
@@ -6196,12 +6432,9 @@ ${baseDirectory}/
             vehicle.assignedTech = assignTechnician(newStep);
 
             if (!vehicle.noteHistory) vehicle.noteHistory = [];
-            vehicle.noteHistory.push({
-                text: 'Manually moved from ' + oldStep + ' to ' + newStep,
-                timestamp: new Date(),
-                user: currentUser ? currentUser.username : 'Unknown',
-                id: Date.now() + Math.random()
-            });
+            const _mvNote = 'Manually moved from ' + oldStep + ' to ' + newStep;
+            vehicle.noteHistory.push({ text: _mvNote, timestamp: new Date(), user: currentUser ? currentUser.username : 'Unknown', id: Date.now() + Math.random() });
+            await saveNoteToSupabase(vehicle, _mvNote);
 
             await persistVehicleState(vehicle);
             closeDialog();
@@ -6220,12 +6453,9 @@ ${baseDirectory}/
             
             // Add to note history
             if (!vehicle.noteHistory) vehicle.noteHistory = [];
-            vehicle.noteHistory.push({
-                text: `Vehicle moved from ${oldStep} to ${newStep}`,
-                timestamp: new Date(),
-                user: currentUser ? currentUser.username : 'Unknown',
-                id: Date.now() + Math.random()
-            });
+            const _mvNote2 = `Vehicle moved from ${oldStep} to ${newStep}`;
+            vehicle.noteHistory.push({ text: _mvNote2, timestamp: new Date(), user: currentUser ? currentUser.username : 'Unknown', id: Date.now() + Math.random() });
+            await saveNoteToSupabase(vehicle, _mvNote2);
             
             await persistVehicleState(vehicle);
             closeDialog();
@@ -6488,6 +6718,7 @@ Assign a workflow when the vehicle arrives.`);
                     
                     // Reload data
                     await loadDataFromSupabase();
+                    await loadNotifications();
                     render();
                     
                 } catch (error) {
@@ -6809,6 +7040,7 @@ Assign a workflow when the vehicle arrives.`);
                     updateImportDialog(importedCount, skippedCount, errorCount, total,
                         `<span style="color:#63b3ed;">🔄 Reloading data…</span>`);
                     await loadDataFromSupabase();
+                    await loadNotifications();
                     render();
 
                 } else {
@@ -6860,7 +7092,7 @@ Assign a workflow when the vehicle arrives.`);
         }
 
         // Notes and Photo Functions
-        function addNoteToVehicle(vin, noteText) {
+        async function addNoteToVehicle(vin, noteText) {
             const vehicle = vehicles.find(v => v.vin === vin);
             if (!vehicle) return;
             
@@ -6873,19 +7105,23 @@ Assign a workflow when the vehicle arrives.`);
                 vehicle.noteHistory = [];
             }
             
+            const user = currentUser ? currentUser.username : 'Unknown';
             const newNote = {
                 text: noteText.trim(),
                 timestamp: new Date(),
-                user: currentUser ? currentUser.username : 'Unknown',
+                user: user,
                 id: Date.now() + Math.random()
             };
             
             vehicle.noteHistory.push(newNote);
             vehicle.notes = noteText.trim(); // Keep last note for backwards compatibility
+
+            // Persist to Supabase vehicle_notes table
+            await saveNoteToSupabase(vehicle, noteText.trim(), user);
             
             closeDialog();
             showVehicleDetails(vin);
-            alert('✓ Note added to permanent history');
+            alert('✓ Note saved to database');
         }
 
         function saveVehicleNotes(vin, notes) {
@@ -6893,7 +7129,115 @@ Assign a workflow when the vehicle arrives.`);
             addNoteToVehicle(vin, notes);
         }
 
-        function handlePhotoUpload(vin, event) {
+        // Open photo in a lightbox overlay (window.open blocks base64 data URLs)
+        function openPhotoLightbox(src, label) {
+            const existing = document.getElementById('photoLightbox');
+            if (existing) existing.remove();
+
+            const lb = document.createElement('div');
+            lb.id = 'photoLightbox';
+            lb.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:99999;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px;';
+            lb.innerHTML = `
+                <div style="position:relative;max-width:100%;max-height:100%;display:flex;flex-direction:column;align-items:center;gap:12px;">
+                    <img src="${src}" alt="${label}"
+                         style="max-width:90vw;max-height:80vh;object-fit:contain;border-radius:6px;box-shadow:0 4px 40px rgba(0,0,0,0.6);">
+                    <div style="color:#fff;font-size:13px;opacity:0.8;">${label}</div>
+                    <button onclick="document.getElementById('photoLightbox').remove()"
+                            style="position:fixed;top:16px;right:16px;background:rgba(255,255,255,0.15);border:none;color:#fff;font-size:24px;width:44px;height:44px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px);">✕</button>
+                    <a href="${src}" download="${label}"
+                       style="padding:8px 20px;background:#4299e1;color:#fff;border-radius:6px;font-size:13px;text-decoration:none;font-weight:600;">⬇ Download</a>
+                </div>
+            `;
+            // Click outside to close
+            lb.addEventListener('click', e => { if (e.target === lb) lb.remove(); });
+            document.body.appendChild(lb);
+        }
+
+        async function deleteVehiclePhoto(vin, photoIdx) {
+            const vehicle = vehicles.find(v => v.vin === vin);
+            if (!vehicle) return;
+
+            const photo = vehicle.photos[photoIdx];
+            if (!photo) return;
+
+            if (!confirm(`Delete photo "${photo.name || 'Photo ' + (photoIdx + 1)}"? This cannot be undone.`)) return;
+
+            vehicle.photos.splice(photoIdx, 1);
+
+            if (supabaseClient && vehicle.id) {
+                try {
+                    const { error } = await supabaseClient.from('vehicles').update({
+                        photos: vehicle.photos.map(p => ({
+                            name:       p.name,
+                            filename:   p.filename,
+                            data:       p.data || null,
+                            uploadedAt: p.uploadedAt,
+                            uploadedBy: p.uploadedBy
+                        }))
+                    }).eq('id', vehicle.id);
+                    if (error) console.warn('Delete photo error:', error.message);
+                } catch(e) {
+                    console.warn('Failed to save after photo delete:', e.message);
+                }
+            }
+
+            closeDialog();
+            showVehicleDetails(vin, 'photos');
+        }
+
+        async function deleteVehiclePhoto(vin, photoIdx) {
+            const vehicle = vehicles.find(v => v.vin === vin);
+            if (!vehicle) return;
+
+            const photo = vehicle.photos[photoIdx];
+            if (!photo) return;
+
+            if (!confirm(`Delete photo "${photo.name || 'Photo ' + (photoIdx + 1)}"? This cannot be undone.`)) return;
+
+            vehicle.photos.splice(photoIdx, 1);
+
+            if (supabaseClient && vehicle.id) {
+                try {
+                    const { error } = await supabaseClient.from('vehicles').update({
+                        photos: vehicle.photos.map(p => ({
+                            name:       p.name,
+                            filename:   p.filename,
+                            data:       p.data || null,
+                            uploadedAt: p.uploadedAt,
+                            uploadedBy: p.uploadedBy
+                        }))
+                    }).eq('id', vehicle.id);
+                    if (error) console.warn('Delete photo error:', error.message);
+                } catch(e) {
+                    console.warn('Failed to save after photo delete:', e.message);
+                }
+            }
+
+            closeDialog();
+            showVehicleDetails(vin, 'photos');
+        }
+
+        // Compress image to JPEG at reduced resolution for DB storage
+        async function compressImage(file, maxWidth, quality) {
+            return new Promise(resolve => {
+                const reader = new FileReader();
+                reader.onload = e => {
+                    const img = new Image();
+                    img.onload = () => {
+                        const scale = Math.min(1, maxWidth / img.width);
+                        const canvas = document.createElement('canvas');
+                        canvas.width  = Math.round(img.width  * scale);
+                        canvas.height = Math.round(img.height * scale);
+                        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+                        resolve(canvas.toDataURL('image/jpeg', quality));
+                    };
+                    img.src = e.target.result;
+                };
+                reader.readAsDataURL(file);
+            });
+        }
+
+        async function handlePhotoUpload(vin, event) {
             const files = event.target.files;
             if (!files.length) return;
 
@@ -6904,26 +7248,44 @@ Assign a workflow when the vehicle arrives.`);
 
             for (let i = 0; i < files.length; i++) {
                 const file = files[i];
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    const photoFilename = `photo${vehicle.photos.length + 1}_${file.name.split('.')[0]}_${timestamp}.jpg`;
-                    const filepath = savePhotoToFileSystem(vehicle, e.target.result, photoFilename);
-                    
-                    vehicle.photos.push({
-                        name: file.name,
-                        filename: photoFilename,
-                        filepath: filepath,
-                        data: e.target.result,
-                        uploadedAt: new Date(),
-                        uploadedBy: currentUser.name
-                    });
-                    render();
+
+                // Compress to max 1200px wide at 80% quality — keeps previews sharp but small (~100-200KB)
+                const compressed = await compressImage(file, 1200, 0.80);
+
+                const photoEntry = {
+                    name:       file.name,
+                    filename:   `${vehicle.stockNumber}_${timestamp}_${i + 1}_${file.name}`,
+                    data:       compressed,
+                    uploadedAt: new Date().toISOString(),
+                    uploadedBy: currentUser ? currentUser.name : 'Unknown'
                 };
-                reader.readAsDataURL(file);
+
+                if (!vehicle.photos) vehicle.photos = [];
+                vehicle.photos.push(photoEntry);
             }
-            
-            event.target.value = ''; // Reset file input
-            alert(`✓ ${files.length} photo(s) uploaded to ${photosDirectory}/${vehicle.stockNumber}/`);
+
+            // Save compressed photos to Supabase vehicles table
+            if (supabaseClient && vehicle.id) {
+                try {
+                    const { error } = await supabaseClient.from('vehicles').update({
+                        photos: vehicle.photos.map(p => ({
+                            name:       p.name,
+                            filename:   p.filename,
+                            data:       p.data,
+                            uploadedAt: p.uploadedAt,
+                            uploadedBy: p.uploadedBy
+                        }))
+                    }).eq('id', vehicle.id);
+                    if (error) console.warn('Photo save error:', error.message);
+                } catch(pe) {
+                    console.warn('Failed to persist photos:', pe.message);
+                }
+            }
+
+            event.target.value = '';
+            closeDialog();
+            showVehicleDetails(vin, 'photos');
+            alert(`✓ ${files.length} photo(s) uploaded`);
         }
 
         function viewVehicleHistory(stockNumber) {
@@ -7109,8 +7471,6 @@ Assign a workflow when the vehicle arrives.`);
                     ${content}
                 </div>
             `;
-            // Inject floating scan FAB after each render
-            injectScanButton();
         }
 
         // ==================== FILE-BASED STORAGE SYSTEM ====================
@@ -7433,648 +7793,441 @@ Assign a workflow when the vehicle arrives.`);
             render(); // no session — show login
         }
 
-        // ==================== VIN / QR SCANNER ====================
+        // ==================== VAUTO XLS PARSER (BIFF8) ====================
 
-        // ---- In-memory vehicle cache (built once on load, no Supabase per scan) ----
-        let scanCache      = [];
-        let scanCacheReady = false;
+        function parseVautoXLS(buffer) {
+            const data = new Uint8Array(buffer);
+            const view = new DataView(buffer);
 
-        function buildScanCache() {
-            scanCache = vehicles.map(v => ({
-                vin:          (v.vin || '').toUpperCase(),
-                stockNumber:  (v.stockNumber || v.stock_number || '').toUpperCase(),
-                year:         v.year  || '',
-                make:         v.make  || '',
-                model:        v.model || '',
-                currentStep:  v.currentStep  || v.current_step  || '',
-                completedSteps: v.completedSteps || [],
-                skippedSteps:   v.skippedSteps   || [],
-                assignedTech:   v.assignedTech   || v.assigned_tech || '',
-                workflow:     v.workflow  || '',
-                stepStartTime: v.stepStartTime,
-                entryTime:    v.entryTime,
-                tags:         v.tags || []
-            }));
-            scanCacheReady = true;
-            console.log('📦 Scan cache:', scanCache.length, 'vehicles');
-        }
+            function u16(pos) { return view.getUint16(pos, true); }
+            function u32(pos) { return view.getUint32(pos, true); }
+            function f64(pos) { return view.getFloat64(pos, true); }
 
-        function lookupInCache(query) {
-            const q = query.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-            if (!q) return null;
-            return scanCache.find(v =>
-                v.vin === q ||
-                v.stockNumber === q ||
-                v.vin.includes(q) ||
-                v.stockNumber.includes(q)
-            ) || null;
-        }
+            function xlDate(serial) {
+                const d = new Date(Date.UTC(1899, 11, 30) + Math.round(serial) * 86400000);
+                return d.toISOString().slice(0, 10);
+            }
 
-        // ---- Web Audio beep (no CDN) ----
-        let _audioCtx = null;
-        function playScanBeep(success) {
-            try {
-                if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                const ctx = _audioCtx;
-                if (ctx.state === 'suspended') ctx.resume();
-                const osc = ctx.createOscillator();
-                const g   = ctx.createGain();
-                osc.connect(g); g.connect(ctx.destination);
-                if (success) {
-                    osc.frequency.setValueAtTime(880,  ctx.currentTime);
-                    osc.frequency.setValueAtTime(1320, ctx.currentTime + 0.09);
-                    g.gain.setValueAtTime(0.3, ctx.currentTime);
-                    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.25);
-                    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.25);
+            function decodeRK(rk) {
+                let val;
+                if (rk & 0x02) { val = rk >> 2; }
+                else {
+                    const buf = new ArrayBuffer(8);
+                    new DataView(buf).setUint32(4, rk & 0xFFFFFFFC, true);
+                    val = new DataView(buf).getFloat64(0, true);
+                }
+                if (rk & 0x01) val /= 100;
+                return val;
+            }
+
+            // Find Workbook stream
+            let streamStart = -1;
+            for (let i = 512; i < data.length - 4; i++) {
+                if (u16(i) === 0x0809 && u16(i+2) >= 4 && u16(i+2) <= 16) { streamStart = i; break; }
+            }
+            if (streamStart === -1) return null;
+
+            // Build a flat record list (merging CONTINUE records into their parent)
+            const records = []; // { type, data: Uint8Array }
+            let i = streamStart;
+            while (i < data.length - 4) {
+                const recType = u16(i);
+                const recLen  = u16(i + 2);
+                if (recLen > 65535 || i + 4 + recLen > data.length) break;
+                const body = data.slice(i + 4, i + 4 + recLen);
+
+                if (recType === 0x003C && records.length > 0) {
+                    // CONTINUE — append to last record's data
+                    const prev = records[records.length - 1];
+                    const merged = new Uint8Array(prev.data.length + body.length);
+                    merged.set(prev.data, 0);
+                    merged.set(body, prev.data.length);
+                    prev.data = merged;
                 } else {
-                    osc.frequency.setValueAtTime(200, ctx.currentTime);
-                    g.gain.setValueAtTime(0.25, ctx.currentTime);
-                    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
-                    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.35);
+                    records.push({ type: recType, data: body });
                 }
-            } catch(e) {}
-        }
-
-        // ==================== VIN SCANNER ====================
-        // Uses getUserMedia + canvas pixel sampling for Code-128/39 decoding
-        // Pure JS, no external deps, works on iOS Safari
-
-        let scannerActive = false;
-        let torchOn       = false;
-        let _scanStream   = null;
-        let _sharedStream = null;
-        let _scanInterval = null;
-        let _torchTrack   = null;
-
-        // ── Barcode decoder ───────────────────────────────────────────────────
-        // ── Debug helper — shows what the decoder actually sees ───────────────
-        function getDecodeDebugInfo(imageData) {
-            const { data, width, height } = imageData;
-            const y = Math.floor(height * 0.5);
-            const lum = new Uint8Array(width);
-            let sum = 0;
-            for (let x = 0; x < width; x++) {
-                const i = (y * width + x) * 4;
-                lum[x] = (data[i]*77 + data[i+1]*150 + data[i+2]*29) >> 8;
-                sum += lum[x];
+                i += 4 + recLen;
             }
-            const mean = sum / width;
-            const thresh = mean * 0.75;
-            let transitions = 0, darkRuns = 0, minRun = 9999, maxRun = 0;
-            let prev = lum[0] < thresh, runLen = 1;
-            for (let x = 1; x < width; x++) {
-                const d = lum[x] < thresh;
-                if (d !== prev) {
-                    transitions++;
-                    if (prev) { darkRuns++; minRun = Math.min(minRun, runLen); maxRun = Math.max(maxRun, runLen); }
-                    runLen = 1;
-                } else runLen++;
-                prev = d;
-            }
-            return "r:" + darkRuns + " t:" + transitions + " lum:" + Math.round(mean) + " min:" + (minRun===9999?0:minRun) + " max:" + maxRun;
-        }
 
-        // ── Barcode decoder ───────────────────────────────────────────────────
-        // Histogram-based Code-128 decoder. Finds the module width from the
-        // distribution of all run widths in the row, then matches patterns.
-
-        const C128_TABLE = [[2,1,2,2,2,2],[2,2,2,1,2,2],[2,2,2,2,2,1],[1,2,1,2,2,3],[1,2,1,3,2,2],[1,3,1,2,2,2],[1,2,2,2,1,3],[1,2,2,3,1,2],[1,3,2,2,1,2],[2,2,1,2,1,3],[2,2,1,3,1,2],[2,3,1,2,1,2],[1,1,2,2,3,2],[1,2,2,1,3,2],[1,2,2,2,3,1],[1,1,3,2,2,2],[1,2,3,1,2,2],[1,2,3,2,2,1],[2,2,3,2,1,1],[2,2,1,1,3,2],[2,2,1,2,3,1],[2,1,3,2,1,2],[2,2,3,1,1,2],[3,1,2,1,3,1],[3,1,1,2,2,2],[3,2,1,1,2,2],[3,2,1,2,2,1],[3,1,2,2,1,2],[3,2,2,1,1,2],[3,2,2,2,1,1],[2,1,2,1,2,3],[2,1,2,3,2,1],[2,3,2,1,2,1],[1,1,1,3,2,3],[1,3,1,1,2,3],[1,3,1,3,2,1],[1,1,2,3,1,3],[1,3,2,1,1,3],[1,3,2,3,1,1],[2,1,1,3,1,3],[2,3,1,1,1,3],[2,3,1,3,1,1],[1,1,2,1,3,3],[1,1,2,3,3,1],[1,3,2,1,3,1],[1,1,3,1,2,3],[1,1,3,3,2,1],[1,3,3,1,2,1],[3,1,3,1,2,1],[2,1,1,3,3,1],[2,3,1,1,3,1],[2,1,3,1,1,3],[2,1,3,3,1,1],[2,1,3,1,3,1],[3,1,1,1,2,3],[3,1,1,3,2,1],[3,3,1,1,2,1],[3,1,2,1,1,3],[3,1,2,3,1,1],[3,3,2,1,1,1],[3,1,4,1,1,1],[2,2,1,4,1,1],[4,3,1,1,1,1],[1,1,1,2,2,4],[1,1,1,4,2,2],[1,2,1,1,2,4],[1,2,1,4,2,1],[1,4,1,1,2,2],[1,4,1,2,2,1],[1,1,2,2,1,4],[1,1,2,4,1,2],[1,2,2,1,1,4],[1,2,2,4,1,1],[1,4,2,1,1,2],[1,4,2,2,1,1],[2,4,1,2,1,1],[2,2,1,1,1,4],[4,1,3,1,1,1],[2,4,1,1,1,2],[1,3,4,1,1,1],[1,1,1,2,4,2],[1,2,1,1,4,2],[1,2,1,2,4,1],[1,1,4,2,1,2],[1,2,4,1,1,2],[1,2,4,2,1,1],[4,1,1,2,1,2],[4,2,1,1,1,2],[4,2,1,2,1,1],[2,1,2,1,4,1],[2,1,4,1,2,1],[4,1,2,1,2,1],[1,1,1,1,4,3],[1,1,1,3,4,1],[1,3,1,1,4,1],[1,1,4,1,1,3],[1,1,4,3,1,1],[4,1,1,1,1,3],[4,1,1,3,1,1],[1,1,3,1,4,1],[1,1,4,1,3,1],[3,1,1,1,4,1],[4,1,1,1,3,1],[2,1,1,4,1,2],[2,1,1,2,1,4],[2,1,1,2,3,2],[2,3,3,1,1,1]];
-
-        function decodeBarcodeFromImageData(imageData) {
-            // ── QR codes via jsQR ─────────────────────────────────────────────
-            if (typeof jsQR === "function") {
-                const qr = jsQR(imageData.data, imageData.width, imageData.height,
-                                { inversionAttempts: "dontInvert" });
-                if (qr && qr.data && qr.data.length >= 4) return qr.data;
-            }
-            // ── 1-D barcodes: scan 7 horizontal rows ─────────────────────────
-            const { data, width, height } = imageData;
-            for (const rf of [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65]) {
-                const y = Math.floor(height * rf);
-                const lum = new Uint8Array(width);
-                let sum = 0;
-                for (let x = 0; x < width; x++) {
-                    const i = (y * width + x) * 4;
-                    lum[x] = (data[i]*77 + data[i+1]*150 + data[i+2]*29) >> 8;
-                    sum += lum[x];
-                }
-                const mean = sum / width;
-                for (const tm of [0.75, 0.70, 0.80, 0.65, 0.85]) {
-                    const runs = buildRuns(lum, width, mean * tm);
-                    const c39 = tryCode39(runs);
-                    if (c39) return c39;
-                    const c128 = tryCode128(runs) || tryCode128(runs.slice().reverse());
-                    if (c128) return c128;
+            // Parse SST from merged record data
+            const sst = [];
+            const sstRec = records.find(r => r.type === 0x00FC);
+            if (sstRec) {
+                const b = sstRec.data;
+                const bView = new DataView(b.buffer, b.byteOffset, b.byteLength);
+                const unique = bView.getUint32(4, true);
+                let pos = 8;
+                for (let s = 0; s < unique && pos < b.length; s++) {
+                    if (pos + 3 > b.length) break;
+                    const nchars = bView.getUint16(pos, true);
+                    const flags  = b[pos + 2];
+                    pos += 3;
+                    if (flags & 0x04) { // rich text run count
+                        const rtCount = bView.getUint16(pos, true);
+                        pos += 2 + rtCount * 4;
+                    }
+                    if (flags & 0x08) { // far east
+                        pos += 4 + bView.getUint32(pos, true);
+                    }
+                    let str = '';
+                    if (flags & 0x01) { // UTF-16LE
+                        for (let c = 0; c < nchars && pos + 1 < b.length; c++) {
+                            str += String.fromCharCode(bView.getUint16(pos, true)); pos += 2;
+                        }
+                    } else { // Latin-1
+                        for (let c = 0; c < nchars && pos < b.length; c++) {
+                            str += String.fromCharCode(b[pos++]);
+                        }
+                    }
+                    sst.push(str);
                 }
             }
-            return null;
-        }
 
-        function buildRuns(lum, width, thresh) {
-            const runs = [];
-            let curDark = lum[0] < thresh, len = 1;
-            for (let x = 1; x < width; x++) {
-                const dark = lum[x] < thresh;
-                if (dark === curDark) { len++; }
-                else { runs.push([curDark, len]); curDark = dark; len = 1; }
+            // Parse all cell records
+            const cells = {};
+            for (const rec of records) {
+                const b = rec.data;
+                const bv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+                if (rec.type === 0x00FD && b.length >= 10) { // LABELSST
+                    const row = bv.getUint16(0, true), col = bv.getUint16(2, true);
+                    const idx = bv.getUint32(6, true);
+                    if (idx < sst.length) cells[`${row},${col}`] = sst[idx];
+                } else if (rec.type === 0x0203 && b.length >= 14) { // NUMBER
+                    cells[`${bv.getUint16(0,true)},${bv.getUint16(2,true)}`] = bv.getFloat64(6, true);
+                } else if (rec.type === 0x027E && b.length >= 10) { // RK
+                    cells[`${bv.getUint16(0,true)},${bv.getUint16(2,true)}`] = decodeRK(bv.getUint32(6, true));
+                } else if (rec.type === 0x00BD && b.length >= 6) { // MULRK
+                    const row = bv.getUint16(0, true), firstCol = bv.getUint16(2, true);
+                    const n = (b.length - 6) / 6;
+                    for (let k = 0; k < n; k++) {
+                        cells[`${row},${firstCol+k}`] = decodeRK(bv.getUint32(4 + k*6 + 2, true));
+                    }
+                }
             }
-            runs.push([curDark, len]);
-            return runs;
+
+            const rowNums = [...new Set(Object.keys(cells).map(k => parseInt(k.split(',')[0])))];
+            const maxRow  = Math.max(...rowNums);
+            const cell    = (r, c) => cells[`${r},${c}`];
+
+            if (cell(0, 0) !== 'Stock #') return null;
+
+            // Anchor on VIN in col 1 — only process rows where col 1 is a valid 17-char VIN
+            const vinRe = /^[A-HJ-NPR-Z0-9]{17}$/i;
+
+            const results = [];
+            for (let r = 1; r <= maxRow; r++) {
+                const vin = (cell(r, 1) || '').toString().trim().toUpperCase();
+                if (!vinRe.test(vin)) continue;
+
+                const stock     = (cell(r, 0) || '').toString().trim().replace(/[^\w]/g, '').toUpperCase();
+                const year      = cell(r, 2) ? String(Math.round(cell(r, 2))) : '';
+                const make      = (cell(r, 3) || '').toString().trim();
+                const model     = (cell(r, 4) || '').toString().trim().replace(/[!'"]/g, '');
+                const miles     = cell(r, 5) ? Math.round(cell(r, 5)) : 0;
+                const type      = (cell(r, 6) || '').toString().trim();
+                const invDate   = cell(r, 7) ? xlDate(cell(r, 7)) : '';
+
+                if (!stock || stock.length < 4) continue;
+                results.push({ stock, vin, year, make, model, miles, type, inventoryDate: invDate });
+            }
+            return results;
         }
 
-        // ── Code 39 ──────────────────────────────────────────────────────────
-        const C39 = (function() {
-            const fwd = {
-                "000110100":"0","100100001":"1","001100001":"2","101100000":"3",
-                "000110001":"4","100110000":"5","001110000":"6","000100101":"7",
-                "100100100":"8","001100100":"9","100001001":"A","001001001":"B",
-                "101001000":"C","000011001":"D","100011000":"E","001011000":"F",
-                "000001101":"G","100001100":"H","001001100":"I","000011100":"J",
-                "100000011":"K","001000011":"L","101000010":"M","000010011":"N",
-                "100010010":"O","001010010":"P","000000111":"Q","100000110":"R",
-                "001000110":"S","000010110":"T","110000001":"U","011000001":"V",
-                "111000000":"W","010010001":"X","110010000":"Y","011010000":"Z",
-                "010000101":"-","110000100":".","011000100":" ","010101000":"$",
-                "010100010":"/","010001010":"+","000101010":"%","010010100":"*"
+        // ==================== NOTIFICATION SYSTEM ====================
+
+        let notifications = []; // in-memory store
+
+        async function loadNotifications() {
+            if (!supabaseClient || !currentLocationId) return;
+            try {
+                const { data } = await supabaseClient
+                    .from('recon_notifications')
+                    .select('*')
+                    .eq('location_id', currentLocationId)
+                    .order('created_at', { ascending: false })
+                    .limit(50);
+                if (data) {
+                    notifications = data;
+                    updateNotifBadge();
+                }
+            } catch(e) {
+                // Table may not exist yet — silently ignore
+            }
+        }
+
+        async function addNotification(message, type = 'import', meta = {}) {
+            const notif = {
+                location_id: currentLocationId,
+                message,
+                type,
+                meta: JSON.stringify(meta),
+                read: false,
+                created_at: new Date().toISOString()
             };
-            const rev = {};
-            for (const [b,c] of Object.entries(fwd)) rev[b.split("").reverse().join("")] = c;
-            return { fwd, rev };
-        })();
-
-        function tryCode39(runs) {
-            // Find narrow/wide split using the largest gap in sorted bar widths
-            const barW = runs.filter(r => r[0]).map(r => r[1]).sort((a,b) => a-b);
-            if (barW.length < 6) return null;
-            let maxGap = 0, wt = barW[Math.floor(barW.length * 0.3)] * 2;
-            for (let i = 1; i < barW.length; i++) {
-                if (barW[i] - barW[i-1] > maxGap) {
-                    maxGap = barW[i] - barW[i-1];
-                    wt = (barW[i-1] + barW[i]) / 2;
+            if (supabaseClient && currentLocationId) {
+                try {
+                    const { data } = await supabaseClient
+                        .from('recon_notifications')
+                        .insert([notif])
+                        .select()
+                        .single();
+                    if (data) notifications.unshift(data);
+                } catch(e) {
+                    notifications.unshift({ ...notif, id: Date.now() });
                 }
-            }
-            for (const [tbl, rev] of [[C39.fwd, false], [C39.rev, true]]) {
-                for (let ri = 0; ri + 8 < runs.length; ri++) {
-                    if (!runs[ri][0]) continue;
-                    if (c39Sym(runs, ri, wt, tbl) !== "*") continue;
-                    const chars = [];
-                    let pos = ri + 9;
-                    while (pos < runs.length && !runs[pos][0]) pos++;
-                    while (pos + 8 < runs.length) {
-                        if (!runs[pos][0]) { pos++; continue; }
-                        const ch = c39Sym(runs, pos, wt, tbl);
-                        if (ch === null) break;
-                        if (ch === "*") {
-                            if (rev) chars.reverse();
-                            const s = chars.join("").replace(/[^A-Za-z0-9]/g, "");
-                            if (s.length >= 6) return s;
-                            break;
-                        }
-                        chars.push(ch);
-                        pos += 9;
-                        while (pos < runs.length && !runs[pos][0]) pos++;
-                    }
-                }
-            }
-            return null;
-        }
-
-        function c39Sym(runs, ri, wt, tbl) {
-            if (ri + 8 >= runs.length || !runs[ri][0]) return null;
-            let bits = "";
-            for (let k = 0; k < 9; k++) {
-                if (ri + k >= runs.length) return null;
-                bits += runs[ri+k][1] >= wt ? "1" : "0";
-            }
-            return tbl[bits] !== undefined ? tbl[bits] : null;
-        }
-
-        // ── Code 128 ─────────────────────────────────────────────────────────
-        function tryCode128(runs) {
-            const hist = {};
-            for (const r of runs) hist[r[1]] = (hist[r[1]] || 0) + 1;
-            const allW = runs.map(r => r[1]).sort((a,b) => a-b);
-            const medW = allW[Math.floor(allW.length * 0.5)] || 1;
-            let bestCnt = 0, mod = 1;
-            for (const [w, cnt] of Object.entries(hist)) {
-                const wn = +w;
-                if (wn <= medW && cnt > bestCnt) { bestCnt = cnt; mod = wn; }
-            }
-            for (let ri = 0; ri + 5 < runs.length; ri++) {
-                if (!runs[ri][0]) continue;
-                const sv = c128Sym(runs, ri, mod);
-                let charset;
-                if      (sv === 103) charset = "A";
-                else if (sv === 104) charset = "B";
-                else if (sv === 105) charset = "C";
-                else continue;
-                let pos = ri + 6;
-                const chars = [];
-                let valid = false;
-                while (pos + 5 < runs.length) {
-                    if (pos + 6 < runs.length && runs[pos][0]) {
-                        const st = runs[pos][1]+runs[pos+1][1]+runs[pos+2][1]+
-                                   runs[pos+3][1]+runs[pos+4][1]+runs[pos+5][1]+runs[pos+6][1];
-                        const sm = st / 13;
-                        let ok = true;
-                        for (const [k,v] of [[0,2],[1,3],[2,3],[3,1],[4,1],[5,1],[6,2]]) {
-                            if (Math.abs(runs[pos+k][1]/sm - v) > 0.75) { ok=false; break; }
-                        }
-                        if (ok) { valid = true; break; }
-                    }
-                    const val = c128Sym(runs, pos, mod);
-                    if (val < 0) break;
-                    if (val === 106) { valid = true; break; }
-                    if (val === 99)  { charset = "C"; pos += 6; continue; }
-                    if (val === 100) { charset = "B"; pos += 6; continue; }
-                    if (val === 101) { charset = "A"; pos += 6; continue; }
-                    if (val === 102 || val === 97 || val === 96) { pos += 6; continue; }
-                    chars.push(c128Char(val, charset));
-                    pos += 6;
-                }
-                if (chars.length > 0) chars.pop(); // strip checksum
-                const result = chars.join("").replace(/[^A-Za-z0-9]/g, "");
-                if (valid && result.length >= 6) return result;
-            }
-            return null;
-        }
-
-        function c128Sym(runs, ri, mod) {
-            if (ri + 5 >= runs.length) return -1;
-            const tot = runs[ri][1]+runs[ri+1][1]+runs[ri+2][1]+
-                        runs[ri+3][1]+runs[ri+4][1]+runs[ri+5][1];
-            const sm = tot / 11;
-            let bestVal = -1, bestErr = 0.75;
-            for (const m of [sm, mod, (sm+mod)/2]) {
-                if (m < 0.5) continue;
-                for (let i = 0; i < C128_TABLE.length; i++) {
-                    const p = C128_TABLE[i];
-                    let maxE = 0;
-                    for (let k = 0; k < 6; k++) {
-                        const e = Math.abs(runs[ri+k][1]/m - p[k]);
-                        if (e > maxE) maxE = e;
-                        if (maxE >= bestErr) break;
-                    }
-                    if (maxE < bestErr) { bestErr = maxE; bestVal = i; }
-                }
-            }
-            return bestVal;
-        }
-
-        function c128Char(val, charset) {
-            if (charset === "C") return String(val).padStart(2, "0");
-            if (charset === "B" && val <= 94) return String.fromCharCode(val + 32);
-            if (charset === "A") {
-                if (val <= 63) return String.fromCharCode(val + 32);
-                if (val <= 95) return String.fromCharCode(val - 64);
-            }
-            return "";
-        }
-
-        // ── Scanner UI ────────────────────────────────────────────────────────
-
-        function injectScannerCSS() {
-            if (document.getElementById("scannerCSS")) return;
-            const s = document.createElement("style");
-            s.id = "scannerCSS";
-            s.textContent = [
-                "@keyframes vinSlideUp{from{transform:translateY(100%);opacity:0}to{transform:translateY(0);opacity:1}}",
-                "@keyframes scanBeam{0%,100%{top:20%;opacity:.5}50%{top:75%;opacity:1}}",
-                "#scanBeamLine{position:absolute;left:5%;right:5%;height:3px;z-index:10;pointer-events:none;",
-                "background:linear-gradient(90deg,transparent,#63b3ed 20%,#90cdf4 50%,#63b3ed 80%,transparent);",
-                "animation:scanBeam 1.8s ease-in-out infinite;}",
-                "#torchBtn.lit{background:rgba(255,220,50,.25)!important;border-color:rgba(255,220,50,.8)!important;}",
-                "#vinScannerVideo{width:100%;height:100%;object-fit:cover;display:block;}"
-            ].join("");
-            document.head.appendChild(s);
-        }
-
-        function openVinScanner() {
-            if (!currentUser) return;
-            closeVinScanner();
-            injectScannerCSS();
-            torchOn = false;
-            const cacheLabel = scanCacheReady ? ("📦 " + scanCache.length + " vehicles ready") : "⏳ Loading inventory…";
-            const modal = document.createElement("div");
-            modal.id = "vinScannerModal";
-            modal.style.cssText = "position:fixed;inset:0;background:#000;z-index:5000;display:flex;flex-direction:column;align-items:center;";
-            modal.innerHTML = [
-                '<div style="width:100%;max-width:480px;height:100%;display:flex;flex-direction:column;">',
-                  '<div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;background:rgba(0,0,0,.85);flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.08);">',
-                    '<div>',
-                      '<div style="color:#fff;font-size:16px;font-weight:700;">📷 VIN Scanner</div>',
-                      '<div style="color:#718096;font-size:11px;margin-top:1px;">Hold camera steady over the barcode</div>',
-                    '</div>',
-                    '<div style="display:flex;gap:8px;align-items:center;">',
-                      '<button id="torchBtn" onclick="toggleTorch()" style="background:rgba(255,255,255,.08);border:2px solid rgba(255,255,255,.12);color:white;width:40px;height:40px;border-radius:50%;font-size:18px;cursor:pointer;display:none;align-items:center;justify-content:center;">🔦</button>',
-                      '<button onclick="closeVinScanner()" style="background:rgba(255,255,255,.08);border:none;color:white;width:40px;height:40px;border-radius:50%;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;">✕</button>',
-                    '</div>',
-                  '</div>',
-                  '<div style="position:relative;flex:1;min-height:0;background:#111;overflow:hidden;">',
-                    '<video id="vinScannerVideo" autoplay playsinline muted></video>',
-                    '<canvas id="vinScanCanvas" style="display:none;"></canvas>',
-                    '<div id="scanBeamLine"></div>',
-                    '<div style="position:absolute;left:5%;right:5%;top:38%;height:24%;border:2px solid rgba(99,179,237,0.85);border-radius:4px;pointer-events:none;z-index:15;box-shadow:0 0 0 9999px rgba(0,0,0,0.35);"></div>',
-                    '<div style="position:absolute;left:50%;top:calc(38% - 20px);transform:translateX(-50%);background:rgba(0,0,0,0.55);color:#90cdf4;font-size:10px;font-weight:700;padding:2px 10px;border-radius:10px;white-space:nowrap;z-index:16;pointer-events:none;">Align barcode inside box</div>',
-                    '<div id="scanChip" style="position:absolute;top:10px;left:50%;transform:translateX(-50%);background:rgba(66,153,225,.92);color:white;padding:5px 16px;border-radius:20px;font-size:12px;font-weight:700;white-space:nowrap;z-index:20;">⏳ Starting camera…</div>',
-                    '<div style="position:absolute;bottom:8px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.6);color:#a0aec0;padding:3px 12px;border-radius:20px;font-size:10px;font-weight:600;white-space:nowrap;z-index:20;">' + cacheLabel + '</div>',
-                  '</div>',
-                  '<div style="padding:14px 16px 20px;background:rgba(0,0,0,.9);flex-shrink:0;">',
-                    '<div style="color:#4a5568;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;">Manual entry</div>',
-                    '<div style="display:flex;gap:8px;">',
-                      '<input id="vinManualInput" type="text" placeholder="VIN or Stock #" style="flex:1;padding:10px 13px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:white;font-size:14px;outline:none;" onkeydown="if(event.keyCode===13)lookupVinManual()">',
-                      '<button onclick="lookupVinManual()" style="background:#4299e1;color:white;border:none;border-radius:8px;padding:10px 18px;font-size:14px;font-weight:700;cursor:pointer;">Go</button>',
-                    '</div>',
-                  '</div>',
-                '</div>'
-            ].join("");
-            document.body.appendChild(modal);
-            startScannerCamera();
-        }
-
-        async function startScannerCamera() {
-            scannerActive = true;
-            _torchTrack = null;
-            const video = document.getElementById("vinScannerVideo");
-            const chip  = document.getElementById("scanChip");
-            try {
-                if (_sharedStream && _sharedStream.active) {
-                    _scanStream = _sharedStream;
-                } else {
-                    _scanStream = await navigator.mediaDevices.getUserMedia({
-                        video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
-                        audio: false
-                    });
-                    _sharedStream = _scanStream;
-                }
-                video.srcObject = _scanStream;
-                await video.play();
-                const tracks = _scanStream.getVideoTracks();
-                if (tracks.length) {
-                    _torchTrack = tracks[0];
-                    const caps = _torchTrack.getCapabilities ? _torchTrack.getCapabilities() : {};
-                    if (caps.torch) { const b = document.getElementById("torchBtn"); if (b) b.style.display = "flex"; }
-                    // Reset zoom to 1x — zooming in crops the barcode start/stop symbols off-screen
-                    if (caps.zoom) {
-                        try { await _torchTrack.applyConstraints({ advanced: [{ zoom: 1 }] }); } catch(e) {}
-                    }
-                }
-                if (chip) chip.textContent = "🔍 Scanning…";
-                let _dbgTick = 0;
-                _scanInterval = setInterval(function() {
-                    if (!scannerActive) return;
-                    if (video.readyState < 2 || video.videoWidth === 0) return;
-                    const canvas = document.getElementById("vinScanCanvas");
-                    if (!canvas) return;
-
-                    const vw = video.videoWidth;
-                    const vh = video.videoHeight;
-
-                    // Use FULL width — never downscale horizontally or the start/stop
-                    // symbols get cropped when the barcode fills the frame.
-                    // Only crop vertically to the center 60% strip for speed.
-                    const cropY = Math.floor(vh * 0.20);
-                    const cropH = Math.floor(vh * 0.60);
-
-                    canvas.width  = vw;
-                    canvas.height = cropH;
-                    const ctx = canvas.getContext("2d", { willReadFrequently: true });
-                    ctx.drawImage(video, 0, cropY, vw, cropH, 0, 0, vw, cropH);
-                    const imgData = ctx.getImageData(0, 0, vw, cropH);
-                    const result = decodeBarcodeFromImageData(imgData);
-                    if (result && result.length >= 4) {
-                        handleScanResult(result);
-                    } else {
-                        // Show debug info every 10 ticks (~2s)
-                        _dbgTick++;
-                        if (_dbgTick % 10 === 0 && chip) {
-                            const dbg = getDecodeDebugInfo(imgData);
-                            chip.textContent = dbg;
-                        }
-                    }
-                }, 100);
-            } catch(err) {
-                console.warn("Camera error:", err);
-                if (chip) { chip.style.background = "rgba(229,62,62,.9)"; chip.textContent = "📵 Camera error — use manual entry"; }
-            }
-        }
-
-        async function toggleTorch() {
-            if (!_torchTrack) return;
-            try {
-                torchOn = !torchOn;
-                await _torchTrack.applyConstraints({ advanced: [{ torch: torchOn }] });
-                const btn = document.getElementById("torchBtn");
-                if (btn) { btn.classList.toggle("lit", torchOn); btn.title = torchOn ? "Turn off flashlight" : "Turn on flashlight"; }
-            } catch(e) { torchOn = !torchOn; }
-        }
-
-        function handleScanResult(raw) {
-            if (!scannerActive) return;
-            scannerActive = false;
-            clearInterval(_scanInterval); _scanInterval = null;
-            if (torchOn && _torchTrack) { try { _torchTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch(e) {} torchOn = false; }
-            _scanStream = null;
-            const chip = document.getElementById("scanChip");
-            let cleaned = raw.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-            // I, O, Q are forbidden VIN characters (ISO 3779).
-            // OEM stickers often prepend 'I' as a label identifier — always strip it.
-            // Strip any number of leading I's since none can be part of a real VIN.
-            cleaned = cleaned.replace(/^I+/, "");
-            const hit = lookupInCache(cleaned);
-            if (chip) { chip.style.background = hit ? "rgba(72,187,120,.95)" : "rgba(229,62,62,.92)"; chip.textContent = hit ? "✅ Found!" : "🚫 Not in recon"; }
-            playScanBeep(!!hit);
-            if (navigator.vibrate) navigator.vibrate(hit ? [60,30,60] : [180]);
-            setTimeout(function(){ closeVinScanner(); showVinResult(cleaned, raw, hit); }, 550);
-        }
-
-        function closeVinScanner() {
-            scannerActive = false;
-            clearInterval(_scanInterval); _scanInterval = null;
-            if (torchOn && _torchTrack) { try { _torchTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch(e) {} torchOn = false; }
-            _scanStream = null;
-            const m = document.getElementById("vinScannerModal");
-            if (m) m.remove();
-        }
-
-        function lookupVinManual() {
-            const input = document.getElementById('vinManualInput');
-            const val   = (input?.value || '').trim();
-            if (!val) return;
-            const cleaned = val.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-            const hit = lookupInCache(cleaned);
-            try { if (_audioCtx && _audioCtx.state === 'suspended') _audioCtx.resume(); } catch(e) {}
-            playScanBeep(!!hit);
-            closeVinScanner();
-            showVinResult(cleaned, val, hit);
-        }
-
-        function showVinResult(query, rawInput, cachedVehicle) {
-            const vehicle = cachedVehicle ? (
-                vehicles.find(v =>
-                    (v.vin||'').toUpperCase()         === cachedVehicle.vin ||
-                    (v.stockNumber||'').toUpperCase() === cachedVehicle.stockNumber
-                ) || cachedVehicle
-            ) : (() => {
-                const q = query.toLowerCase();
-                return vehicles.find(v =>
-                    (v.vin||'').toLowerCase() === q ||
-                    (v.stockNumber||v.stock_number||'').toLowerCase() === q ||
-                    (v.vin||'').toLowerCase().includes(q) ||
-                    (v.stockNumber||v.stock_number||'').toLowerCase().includes(q)
-                );
-            })();
-
-            const existing = document.getElementById('vinResultModal');
-            if (existing) existing.remove();
-
-            const modal = document.createElement('div');
-            modal.id = 'vinResultModal';
-            modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:5000;display:flex;align-items:flex-end;justify-content:center;';
-            modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
-
-            if (!vehicle) {
-                modal.innerHTML = `
-                    <div style="background:white;width:100%;max-width:480px;border-radius:22px 22px 0 0;
-                                padding:28px 22px 44px;animation:vinSlideUp 0.3s ease;">
-                        <div style="text-align:center;margin-bottom:22px;">
-                            <div style="font-size:52px;margin-bottom:10px;">🚫</div>
-                            <div style="font-size:21px;font-weight:800;color:#1a202c;margin-bottom:5px;">Not in Recon</div>
-                            <div style="font-size:14px;color:#718096;">Vehicle not found in the recon system.</div>
-                        </div>
-                        <div style="background:#f7fafc;border-radius:10px;padding:13px 15px;margin-bottom:18px;border:1px solid #e2e8f0;">
-                            <div style="font-size:10px;color:#a0aec0;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">Scanned</div>
-                            <div style="font-family:monospace;font-size:14px;color:#4a5568;word-break:break-all;">${rawInput}</div>
-                        </div>
-                        <div style="display:flex;flex-direction:column;gap:10px;">
-                            <button onclick="document.getElementById('vinResultModal').remove();openVinScanner();"
-                                style="padding:13px;background:#4299e1;color:white;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;">
-                                🔄 Scan Again
-                            </button>
-                            <button onclick="document.getElementById('vinResultModal').remove();"
-                                style="padding:13px;background:#edf2f7;color:#4a5568;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;">
-                                Close
-                            </button>
-                        </div>
-                    </div>`;
             } else {
-                const wf        = workflows[vehicle.workflow] || workflows[Object.keys(workflows)[0]];
-                const wfSteps   = (wf ? wf.steps : STEPS).filter(s => s !== 'Awaiting Arrival');
-                const total     = wfSteps.length;
-                const done      = (vehicle.completedSteps || []).filter(s => wfSteps.includes(s)).length;
-                const pct       = total > 0 ? Math.round((done / total) * 100) : 0;
-                const finished  = vehicle.currentStep === 'Finished';
-                const barColor  = finished ? '#48bb78' : '#4299e1';
-                const stepLabel = finished ? 'Finished ✅' : vehicle.currentStep;
-
-                const pipeline = wfSteps.map((step, i) => {
-                    const isDone    = (vehicle.completedSteps || []).includes(step);
-                    const isCurrent = vehicle.currentStep === step;
-                    const bg  = isDone ? '#48bb78' : isCurrent ? '#4299e1' : '#e2e8f0';
-                    const fg  = isDone || isCurrent ? 'white' : '#a0aec0';
-                    const ico = isDone ? '✓' : isCurrent ? '▶' : (i + 1);
-                    const lbl = step.length > 9 ? step.slice(0,8)+'…' : step;
-                    return `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;flex:1;min-width:44px;">
-                        <div style="width:30px;height:30px;border-radius:50%;background:${bg};color:${fg};
-                                    display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;">${ico}</div>
-                        <div style="font-size:9px;color:${isCurrent?'#2b6cb0':isDone?'#276749':'#a0aec0'};
-                                    font-weight:${isCurrent?700:500};text-align:center;line-height:1.2;">${lbl}</div>
-                    </div>`;
-                }).join('');
-
-                modal.innerHTML = `
-                    <div style="background:white;width:100%;max-width:480px;border-radius:22px 22px 0 0;
-                                overflow:hidden;animation:vinSlideUp 0.3s ease;">
-                        <div style="background:${barColor};padding:18px 20px 14px;color:white;">
-                            <div style="display:flex;justify-content:space-between;align-items:flex-start;">
-                                <div>
-                                    <div style="font-size:19px;font-weight:800;letter-spacing:-0.3px;">
-                                        ${vehicle.year||''} ${vehicle.make||''} ${vehicle.model||''}
-                                    </div>
-                                    <div style="font-size:12px;opacity:0.85;margin-top:2px;">
-                                        Stock: ${vehicle.stockNumber||vehicle.stock_number||'—'}
-                                    </div>
-                                </div>
-                                <div style="text-align:right;">
-                                    <div style="font-size:10px;opacity:0.7;text-transform:uppercase;letter-spacing:0.05em;">Current Step</div>
-                                    <div style="font-size:15px;font-weight:800;">${stepLabel}</div>
-                                </div>
-                            </div>
-                        </div>
-                        <div style="padding:18px 20px;max-height:55vh;overflow-y:auto;-webkit-overflow-scrolling:touch;">
-                            <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
-                                <div style="font-size:13px;font-weight:700;color:#2d3748;">Recon Progress</div>
-                                <div style="font-size:13px;font-weight:700;color:${barColor};">${done}/${total} · ${pct}%</div>
-                            </div>
-                            <div style="background:#e2e8f0;border-radius:20px;height:7px;overflow:hidden;margin-bottom:16px;">
-                                <div style="background:${barColor};height:100%;width:${pct}%;border-radius:20px;transition:width 0.4s;"></div>
-                            </div>
-                            <div style="font-size:10px;color:#a0aec0;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Pipeline</div>
-                            <div style="display:flex;gap:3px;overflow-x:auto;padding-bottom:6px;scrollbar-width:none;-webkit-overflow-scrolling:touch;">
-                                ${pipeline}
-                            </div>
-                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px;
-                                        background:#f7fafc;border-radius:10px;padding:12px 14px;">
-                                <div>
-                                    <div style="font-size:10px;color:#a0aec0;font-weight:600;text-transform:uppercase;margin-bottom:2px;">Tech</div>
-                                    <div style="font-size:13px;font-weight:600;color:#2d3748;">${vehicle.assignedTech||'Unassigned'}</div>
-                                </div>
-                                <div>
-                                    <div style="font-size:10px;color:#a0aec0;font-weight:600;text-transform:uppercase;margin-bottom:2px;">Workflow</div>
-                                    <div style="font-size:13px;font-weight:600;color:#2d3748;">${vehicle.workflow||'—'}</div>
-                                </div>
-                                <div>
-                                    <div style="font-size:10px;color:#a0aec0;font-weight:600;text-transform:uppercase;margin-bottom:2px;">Time in Step</div>
-                                    <div style="font-size:13px;font-weight:600;color:#2d3748;">${formatTimeDiff(vehicle.stepStartTime)}</div>
-                                </div>
-                                <div>
-                                    <div style="font-size:10px;color:#a0aec0;font-weight:600;text-transform:uppercase;margin-bottom:2px;">In System</div>
-                                    <div style="font-size:13px;font-weight:600;color:#2d3748;">${formatTimeDiff(vehicle.entryTime)}</div>
-                                </div>
-                            </div>
-                            <div style="margin-top:8px;font-size:10px;color:#cbd5e0;font-family:monospace;word-break:break-all;">${vehicle.vin||''}</div>
-                        </div>
-                        <div style="padding:12px 20px 38px;display:flex;gap:10px;">
-                            <button onclick="document.getElementById('vinResultModal').remove();openVinScanner();"
-                                style="flex:1;padding:13px;background:#edf2f7;color:#4a5568;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;">
-                                🔄 Scan Again
-                            </button>
-                            <button onclick="document.getElementById('vinResultModal').remove();"
-                                style="flex:1;padding:13px;background:${barColor};color:white;border:none;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;">
-                                Done
-                            </button>
-                        </div>
-                    </div>`;
+                notifications.unshift({ ...notif, id: Date.now() });
             }
-            document.body.appendChild(modal);
+            updateNotifBadge();
         }
 
-        function injectScanButton() {
-            const existing = document.getElementById('vinScanFab');
-            if (existing) existing.remove();
-            if (!currentUser) return;
+        async function markAllNotificationsRead() {
+            notifications.forEach(n => n.read = true);
+            updateNotifBadge();
+            if (supabaseClient && currentLocationId) {
+                try {
+                    await supabaseClient
+                        .from('recon_notifications')
+                        .update({ read: true })
+                        .eq('location_id', currentLocationId)
+                        .eq('read', false);
+                } catch(e) {}
+            }
+        }
 
-            if (!scanCacheReady && vehicles.length > 0) buildScanCache();
+        function updateNotifBadge() {
+            const badge = document.getElementById('notifBadge');
+            if (!badge) return;
+            const unread = notifications.filter(n => !n.read).length;
+            if (unread > 0) {
+                badge.style.display = 'flex';
+                badge.textContent = unread > 9 ? '9+' : unread;
+            } else {
+                badge.style.display = 'none';
+            }
+        }
 
-            const fab = document.createElement('button');
-            fab.id = 'vinScanFab';
-            fab.innerHTML = `<span style="font-size:24px;line-height:1;">📷</span><span style="font-size:10px;font-weight:800;letter-spacing:0.04em;">SCAN</span>`;
-            fab.style.cssText = `
-                position:fixed;bottom:22px;right:22px;z-index:4000;
-                width:62px;height:62px;border-radius:50%;
-                background:linear-gradient(145deg,#2b6cb0,#4299e1);
-                color:white;border:none;cursor:pointer;
-                display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;
-                box-shadow:0 5px 20px rgba(66,153,225,0.55);
-                transition:transform 0.15s,box-shadow 0.15s;
+        function toggleNotificationPanel() {
+            const existing = document.getElementById('notifPanel');
+            if (existing) { existing.remove(); return; }
+
+            const unread = notifications.filter(n => !n.read).length;
+
+            const panel = document.createElement('div');
+            panel.id = 'notifPanel';
+            panel.style.cssText = `
+                position:fixed;top:70px;right:15px;z-index:5000;
+                width:360px;max-height:480px;
+                background:white;border-radius:12px;
+                box-shadow:0 8px 40px rgba(0,0,0,0.18);
+                border:1px solid #e2e8f0;
+                display:flex;flex-direction:column;overflow:hidden;
             `;
-            fab.onmouseenter = () => { fab.style.transform='scale(1.1)'; fab.style.boxShadow='0 8px 28px rgba(66,153,225,0.7)'; };
-            fab.onmouseleave = () => { fab.style.transform='scale(1)';   fab.style.boxShadow='0 5px 20px rgba(66,153,225,0.55)'; };
-            fab.onclick = openVinScanner;
-            document.body.appendChild(fab);
+
+            const rows = notifications.slice(0, 30).map(n => {
+                const dt = new Date(n.created_at);
+                const ago = formatTimeDiff(dt);
+                const bg  = n.read ? '#fff' : '#ebf8ff';
+                const dot = n.read ? '' : '<span style="width:8px;height:8px;border-radius:50%;background:#4299e1;flex-shrink:0;display:inline-block;"></span>';
+                return `<div style="padding:12px 16px;border-bottom:1px solid #f0f0f0;background:${bg};display:flex;gap:10px;align-items:flex-start;">
+                    ${dot}
+                    <div style="flex:1;min-width:0;">
+                        <div style="font-size:13px;color:#2d3748;line-height:1.4;">${n.message}</div>
+                        <div style="font-size:11px;color:#a0aec0;margin-top:3px;">${ago} ago</div>
+                    </div>
+                </div>`;
+            }).join('') || '<div style="padding:24px;text-align:center;color:#a0aec0;font-size:13px;">No notifications yet</div>';
+
+            panel.innerHTML = `
+                <div style="padding:14px 16px;border-bottom:2px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;">
+                    <div style="font-weight:700;font-size:15px;">🔔 Notifications ${unread > 0 ? `<span style="font-size:12px;font-weight:600;color:#4299e1;">(${unread} new)</span>` : ''}</div>
+                    ${unread > 0 ? `<button onclick="markAllNotificationsRead();document.getElementById('notifPanel').remove();" style="font-size:11px;color:#4299e1;background:none;border:none;cursor:pointer;font-weight:600;">Mark all read</button>` : ''}
+                </div>
+                <div style="overflow-y:auto;flex:1;">${rows}</div>
+            `;
+
+            // Close on outside click
+            setTimeout(() => {
+                document.addEventListener('click', function handler(e) {
+                    if (!panel.contains(e.target) && e.target.id !== 'notifBell') {
+                        panel.remove();
+                        document.removeEventListener('click', handler);
+                    }
+                });
+            }, 100);
+
+            document.body.appendChild(panel);
+            if (unread > 0) markAllNotificationsRead();
         }
 
-        // ==================== END VIN / QR SCANNER ====================
+        // ==================== VAUTO IMPORT HANDLER ====================
+
+        // Override handleExcelImport to detect vAuto XLS vs legacy CSV
+        const _originalHandleExcelImport = handleExcelImport;
+
+        async function handleExcelImport(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const isXLS = file.name.toLowerCase().endsWith('.xls') && !file.name.toLowerCase().endsWith('.xlsx');
+
+            if (!isXLS) {
+                // Fall through to original CSV handler
+                return _originalHandleExcelImport(event);
+            }
+
+            // vAuto XLS path
+            const buffer = await file.arrayBuffer();
+            const rows = parseVautoXLS(buffer);
+
+            if (!rows || rows.length === 0) {
+                alert('Could not parse this XLS file. Make sure it is a vAuto inventory export.');
+                return;
+            }
+
+            const total = rows.length;
+            showImportDialog(total);
+            updateImportDialog(0, 0, 0, total,
+                `<span style="color:#63b3ed;">📄 Parsed ${total} vehicles from "${file.name}"</span>`);
+
+            await new Promise(r => setTimeout(r, 80));
+
+            let importedCount = 0, skippedCount = 0, errorCount = 0;
+            const duplicates = [];
+            const newlyAdded = [];
+
+            if (supabaseClient && currentLocationId) {
+                const allStocks = rows.map(r => r.stock.toUpperCase());
+
+                const { data: existing } = await supabaseClient
+                    .from('vehicles')
+                    .select('id, stock_number')
+                    .eq('location_id', currentLocationId)
+                    .in('stock_number', allStocks);
+
+                const existingMap = {};
+                if (existing) existing.forEach(r => { existingMap[r.stock_number] = r.id; });
+
+                const toInsert = rows.filter(r => !existingMap[r.stock.toUpperCase()]);
+                const toUpdate = rows.filter(r =>  existingMap[r.stock.toUpperCase()]);
+
+                updateImportDialog(0, 0, 0, total,
+                    `<span style="color:#63b3ed;">📋 ${toInsert.length} new · ${toUpdate.length} already in system</span>`);
+
+                // Update existing — year/make/model/miles only
+                for (const row of toUpdate) {
+                    const id = existingMap[row.stock.toUpperCase()];
+                    try {
+                        await supabaseClient.from('vehicles').update({
+                            year:  row.year  || undefined,
+                            make:  row.make  || undefined,
+                            model: row.model || undefined,
+                            miles: row.miles || undefined
+                        }).eq('id', id);
+                        skippedCount++;
+                        updateImportDialog(importedCount, skippedCount, errorCount, total,
+                            `<span style="color:#f6ad55;">↻ ${row.stock} — updated</span>`);
+                    } catch(err) {
+                        errorCount++;
+                        updateImportDialog(importedCount, skippedCount, errorCount, total,
+                            `<span style="color:#fc8181;">✗ ${row.stock} — ${err.message}</span>`);
+                    }
+                    await new Promise(r => setTimeout(r, 5));
+                }
+
+                // Insert new vehicles in batches
+                const BATCH = 25;
+                for (let i = 0; i < toInsert.length; i += BATCH) {
+                    const batch = toInsert.slice(i, i + BATCH);
+                    const batchData = batch.map(row => ({
+                        location_id:     currentLocationId,
+                        vin:             row.vin || '',
+                        stock_number:    row.stock.toUpperCase(),
+                        year:            row.year,
+                        make:            row.make,
+                        model:           row.model,
+                        miles:           row.miles,
+                        entry_time:      new Date().toISOString(),
+                        current_step:    'Awaiting Arrival',
+                        step_start_time: new Date().toISOString(),
+                        completed_steps: [],
+                        assigned_tech:   null,
+                        tags:            [],
+                        vehicle_tags:    [],
+                        workflow:        'AWAITING'
+                    }));
+
+                    try {
+                        const { error } = await supabaseClient.from('vehicles').insert(batchData);
+                        if (error) throw new Error(error.message);
+                        importedCount += batch.length;
+                        batch.forEach(r => newlyAdded.push(r.stock));
+                        const nums = batch.map(r => r.stock).join(', ');
+                        updateImportDialog(importedCount, skippedCount, errorCount, total,
+                            `<span style="color:#68d391;">✓ Added: ${nums}</span>`);
+                    } catch(err) {
+                        errorCount += batch.length;
+                        updateImportDialog(importedCount, skippedCount, errorCount, total,
+                            `<span style="color:#fc8181;">✗ Batch error — ${err.message}</span>`);
+                    }
+                    await new Promise(r => setTimeout(r, 10));
+                }
+
+                // Fire notification if anything was added
+                if (newlyAdded.length > 0) {
+                    const msg = `📥 vAuto feed imported ${newlyAdded.length} new vehicle${newlyAdded.length !== 1 ? 's' : ''}: ${newlyAdded.slice(0,5).join(', ')}${newlyAdded.length > 5 ? ` +${newlyAdded.length - 5} more` : ''}`;
+                    await addNotification(msg, 'import', { stocks: newlyAdded, source: 'vauto' });
+                }
+
+                updateImportDialog(importedCount, skippedCount, errorCount, total,
+                    `<span style="color:#63b3ed;">🔄 Reloading…</span>`);
+                await loadDataFromSupabase();
+                await loadNotifications();
+                render();
+
+            } else {
+                // Offline / mock path
+                for (const row of rows) {
+                    const existing = vehicles.find(v => v.stockNumber === row.stock.toUpperCase());
+                    if (existing) {
+                        if (row.year)  existing.year  = row.year;
+                        if (row.make)  existing.make  = row.make;
+                        if (row.model) existing.model = row.model;
+                        if (row.miles) existing.miles = row.miles;
+                        skippedCount++;
+                        updateImportDialog(importedCount, skippedCount, errorCount, total,
+                            `<span style="color:#f6ad55;">↻ ${row.stock} — updated</span>`);
+                    } else {
+                        vehicles.push({
+                            id: Date.now() + Math.random(),
+                            vin: row.vin || '',
+                            stockNumber: row.stock.toUpperCase(),
+                            year: row.year, make: row.make, model: row.model,
+                            miles: row.miles, color: row.color || '',
+                            currentStep: 'Awaiting Arrival',
+                            stepStartTime: new Date(), entryTime: new Date(),
+                            completedSteps: [], skippedSteps: [], tags: [], vehicleTags: [],
+                            assignedTech: null, workflow: 'AWAITING', noteHistory: [], photos: []
+                        });
+                        importedCount++;
+                        newlyAdded.push(row.stock);
+                        updateImportDialog(importedCount, skippedCount, errorCount, total,
+                            `<span style="color:#68d391;">✓ Added: ${row.stock}</span>`);
+                    }
+                    await new Promise(r => setTimeout(r, 5));
+                }
+                if (newlyAdded.length > 0) {
+                    const msg = `📥 Imported ${newlyAdded.length} new vehicle${newlyAdded.length !== 1 ? 's' : ''}: ${newlyAdded.slice(0,5).join(', ')}${newlyAdded.length > 5 ? ` +${newlyAdded.length - 5} more` : ''}`;
+                    addNotification(msg, 'import', { stocks: newlyAdded });
+                }
+                render();
+            }
+
+            finishImportDialog(importedCount, skippedCount, errorCount, duplicates);
+        }
+
+        // Load notifications after login
+        // loadNotifications is called directly after loadDataFromSupabase where needed (see below)
 
     </script>
     <!-- Add Location Modal -->
