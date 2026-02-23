@@ -8963,11 +8963,41 @@ Assign a workflow when the vehicle arrives.`);
             _startQuagga();
         }
 
+        // VIN validation — checks structure, length, forbidden chars (I O Q), and checksum
+        function isValidVIN(vin) {
+            if (!vin || vin.length !== 17) return false;
+            // I, O, Q are never valid in a VIN
+            if (/[IOQ]/.test(vin)) return false;
+            // Must be alphanumeric only
+            if (!/^[A-HJ-NPR-Z0-9]{17}$/.test(vin)) return false;
+            // ISO 3779 check digit (position 9)
+            const transliteration = {
+                'A':1,'B':2,'C':3,'D':4,'E':5,'F':6,'G':7,'H':8,
+                'J':1,'K':2,'L':3,'M':4,'N':5,       'P':7,'R':9,
+                      'S':2,'T':3,'U':4,'V':5,'W':6,'X':7,'Y':8,'Z':9,
+                '0':0,'1':1,'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9
+            };
+            const weights = [8,7,6,5,4,3,2,10,0,9,8,7,6,5,4,3,2];
+            let sum = 0;
+            for (let i = 0; i < 17; i++) {
+                const val = transliteration[vin[i]];
+                if (val === undefined) return false;
+                sum += val * weights[i];
+            }
+            const remainder = sum % 11;
+            const checkDigit = remainder === 10 ? 'X' : String(remainder);
+            return vin[8] === checkDigit;
+        }
+
+        let _vinCandidates = {}; // track consecutive consistent reads
+
         function _startQuagga() {
             if (typeof Quagga === 'undefined') {
                 document.getElementById('vinScanStatus').textContent = '⚠️ Scanner library not loaded';
                 return;
             }
+
+            _vinCandidates = {};
 
             Quagga.init({
                 inputStream: {
@@ -8975,33 +9005,27 @@ Assign a workflow when the vehicle arrives.`);
                     type: 'LiveStream',
                     target: document.getElementById('vinScanViewport'),
                     constraints: {
-                        width:  { min: 640, ideal: 1280, max: 1920 },
-                        height: { min: 480, ideal: 720,  max: 1080 },
+                        width:  { min: 640, ideal: 1920, max: 1920 },
+                        height: { min: 480, ideal: 1080, max: 1080 },
                         facingMode: 'environment',
-                        aspectRatio: { ideal: 16/9 }
                     },
-                    // Only decode the middle 44% of the frame — matches our visual reticle
-                    area: {
-                        top:    '28%',
-                        right:  '4%',
-                        left:   '4%',
-                        bottom: '28%'
-                    },
+                    area: { top: '28%', right: '4%', left: '4%', bottom: '28%' },
                 },
                 locator: {
-                    patchSize: 'medium',
-                    halfSample: true
+                    patchSize: 'large',   // larger patches = better for long VIN barcodes
+                    halfSample: false      // full resolution decode — worth the CPU cost
                 },
-                numOfWorkers: navigator.hardwareConcurrency > 2 ? 2 : 1,
-                frequency: 10,
+                numOfWorkers: 0,           // 0 = main thread, avoids worker issues on iOS Safari
+                frequency: 8,
                 decoder: {
+                    // ONLY Code128 and Code39 — VINs are never i2of5/numeric formats
+                    // i2of5 was the culprit producing all-number garbage
                     readers: [
                         'code_128_reader',
                         'code_39_reader',
                         'code_39_vin_reader',
-                        'i2of5_reader',
                     ],
-                    debug: { drawBoundingBox: false, showFrequency: false }
+                    multiple: false
                 },
                 locate: true
             }, function(err) {
@@ -9014,27 +9038,44 @@ Assign a workflow when the vehicle arrives.`);
                 Quagga.start();
             });
 
-            // Result confidence threshold — only fire when confident
             Quagga.onDetected(function(result) {
                 const code = result.codeResult;
                 if (!code || !code.code) return;
 
-                // Require at least 2 consecutive consistent reads before accepting
-                const errors = code.decodedCodes
+                // Confidence filter — reject sloppy reads
+                const errors = (code.decodedCodes || [])
                     .filter(c => c.error !== undefined)
                     .map(c => c.error);
                 const avgErr = errors.length ? errors.reduce((a,b) => a+b, 0) / errors.length : 1;
-                if (avgErr > 0.18) return; // too many decode errors — ignore
+                if (avgErr > 0.15) return;
 
-                const raw = code.code.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-                // Extract 17-char VIN if embedded in a longer string (some stickers encode extra data)
+                // Normalise — strip spaces/dashes, uppercase
+                const raw = code.code.trim().toUpperCase().replace(/[\s\-]/g, '');
+
+                // Try to extract a 17-char VIN-charset substring
                 const vinMatch = raw.match(/[A-HJ-NPR-Z0-9]{17}/);
-                const vin = vinMatch ? vinMatch[0] : null;
+                if (!vinMatch) return;
+                const candidate = vinMatch[0];
 
-                if (vin) {
-                    Quagga.stop();
-                    _onVinDetected(vin);
+                // Hard reject: must pass ISO 3779 checksum
+                if (!isValidVIN(candidate)) return;
+
+                // Require 3 consistent reads of the same VIN before accepting
+                // (eliminates single-frame flukes)
+                _vinCandidates[candidate] = (_vinCandidates[candidate] || 0) + 1;
+                const count = _vinCandidates[candidate];
+
+                const statusEl = document.getElementById('vinScanStatus');
+                if (count < 3) {
+                    // Show progress feedback without locking in yet
+                    if (statusEl) statusEl.textContent = `Reading… (${count}/3) ${candidate}`;
+                    return;
                 }
+
+                // Locked in
+                Quagga.stop();
+                _vinCandidates = {};
+                _onVinDetected(candidate);
             });
         }
 
