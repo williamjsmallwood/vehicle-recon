@@ -8908,17 +8908,16 @@ Assign a workflow when the vehicle arrives.`);
         let _vinTargetInputId = null;
         let _vinHtml5QrScanner = null;
 
-        // ISO 3779 VIN checksum validation
+        // VIN validation — 17 chars, no I/O/Q, must contain at least some letters (not all digits)
         function isValidVIN(vin) {
             if (!vin || vin.length !== 17) return false;
             if (/[IOQ]/.test(vin)) return false;
             if (!/^[A-HJ-NPR-Z0-9]{17}$/.test(vin)) return false;
-            const xlat = {A:1,B:2,C:3,D:4,E:5,F:6,G:7,H:8,J:1,K:2,L:3,M:4,N:5,P:7,R:9,S:2,T:3,U:4,V:5,W:6,X:7,Y:8,Z:9,0:0,1:1,2:2,3:3,4:4,5:5,6:6,7:7,8:8,9:9};
-            const wt  = [8,7,6,5,4,3,2,10,0,9,8,7,6,5,4,3,2];
-            let sum = 0;
-            for (let i = 0; i < 17; i++) { const v = xlat[vin[i]]; if (v === undefined) return false; sum += v * wt[i]; }
-            const rem = sum % 11;
-            return vin[8] === (rem === 10 ? 'X' : String(rem));
+            // Reject all-numeric strings (those are misreads from numeric barcode formats)
+            if (/^[0-9]+$/.test(vin)) return false;
+            // Must have at least 4 letters (real VINs always do)
+            const letters = (vin.match(/[A-HJ-NPR-Z]/g) || []).length;
+            return letters >= 4;
         }
 
         let _vinReadCounts = {};
@@ -9005,24 +9004,11 @@ Assign a workflow when the vehicle arrives.`);
             if (!vinMatch) return;
             const candidate = vinMatch[0];
 
-            // Must pass ISO checksum — kills all numeric garbage reads
-            if (!isValidVIN(candidate)) {
-                const st = document.getElementById('vinScanStatus');
-                if (st) st.textContent = 'Detected: ' + candidate.slice(0,8) + '… (verifying)';
-                return;
-            }
+            // Reject anything that can't be a VIN (all-numeric misreads, wrong charset, etc)
+            if (!isValidVIN(candidate)) return;
 
-            // Require 2 consistent reads of the same VIN before committing
-            _vinReadCounts[candidate] = (_vinReadCounts[candidate] || 0) + 1;
-            const st = document.getElementById('vinScanStatus');
-
-            if (_vinReadCounts[candidate] < 2) {
-                if (st) st.textContent = 'Reading… ' + candidate;
-                return;
-            }
-
-            // Confirmed — stop and commit
-            closeVinScanner(false);   // false = don't clear the modal yet, _onVinDetected will
+            // One clean valid read is enough — stop and commit
+            closeVinScanner(false);
             _onVinDetected(candidate);
         }
 
