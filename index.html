@@ -8977,56 +8977,66 @@ Assign a workflow when the vehicle arrives.`);
                 return;
             }
 
-            // Choose decode method: native BarcodeDetector (iOS 17+, Android Chrome) or canvas fallback
+            // Detect supported formats — iOS uses dashes, Android uses underscores
             const hasBarcodeDetector = typeof BarcodeDetector !== 'undefined';
-            setStatus(hasBarcodeDetector ? 'Point at VIN barcode' : 'Point at VIN barcode (move slowly)');
 
             if (hasBarcodeDetector) {
+                // Get what this device actually supports, then pick VIN-relevant ones
+                const supported = await BarcodeDetector.getSupportedFormats().catch(() => []);
+                setStatus('Camera ready — formats: ' + (supported.length ? supported.join(', ') : 'all'));
+                // Try with specific formats first; fall back to no filter (all formats) if that fails
                 try {
-                    _vinDetector = new BarcodeDetector({ formats: ['code_128', 'code_39', 'data_matrix', 'itf'] });
+                    const vinFormats = supported.filter(f =>
+                        ['code_128','code-128','code_39','code-39','data_matrix','pdf417'].includes(f)
+                    );
+                    _vinDetector = new BarcodeDetector({ formats: vinFormats.length ? vinFormats : supported });
                 } catch(e) {
-                    _vinDetector = new BarcodeDetector(); // use all formats if specific ones fail
+                    _vinDetector = new BarcodeDetector();
                 }
-                _runBarcodeDetector();
+                // Wait for video to actually have frames before starting
+                video.addEventListener('playing', () => {
+                    setStatus('Scanning… point at VIN barcode');
+                    _runBarcodeDetector();
+                }, { once: true });
+                if (!video.paused && video.readyState >= 3) {
+                    setStatus('Scanning… point at VIN barcode');
+                    _runBarcodeDetector();
+                }
             } else {
-                // Fallback: ZXing loaded inline via dynamic script
+                setStatus('Loading scanner…');
                 _loadZxingAndScan();
             }
         }
 
-        // PATH A: Native BarcodeDetector — fast, no library needed
+        // PATH A: Native BarcodeDetector
         function _runBarcodeDetector() {
             const video = document.getElementById('vinVideo');
             if (!video || _vinLocked) return;
 
-            // Use setTimeout instead of rAF — avoids async pile-up and is fine at 8fps
             setTimeout(async () => {
                 if (_vinLocked || !document.getElementById('vinVideo')) return;
+                const st = document.getElementById('vinScanStatus');
                 try {
                     const barcodes = await _vinDetector.detect(video);
-                    for (const b of barcodes) {
-                        // Show everything detected so user can see what the camera is reading
-                        const raw = b.rawValue.trim().toUpperCase().replace(/[^A-HJ-NPR-Z0-9]/g, '');
-                        const st  = document.getElementById('vinScanStatus');
-
-                        const m = raw.match(/[A-HJ-NPR-Z0-9]{17}/);
-                        if (m && isValidVIN(m[0])) {
-                            _vinLocked = true;
-                            _commitVin(m[0]);
-                            return;
+                    if (barcodes.length > 0) {
+                        for (const b of barcodes) {
+                            const raw = b.rawValue.trim().toUpperCase().replace(/[^A-HJ-NPR-Z0-9]/g, '');
+                            if (st) st.textContent = 'Read: ' + raw.slice(0,24);
+                            const m = raw.match(/[A-HJ-NPR-Z0-9]{17}/);
+                            if (m && isValidVIN(m[0])) {
+                                _vinLocked = true;
+                                _commitVin(m[0]);
+                                return;
+                            }
                         }
-                        // Detected something but it's not a valid VIN — show it so user knows camera is working
-                        if (st && raw.length > 3) {
-                            st.textContent = 'Saw: ' + raw.slice(0, 20) + (raw.length > 20 ? '…' : '') + ' (not a VIN — keep scanning)';
-                            setTimeout(() => { if (st) st.textContent = 'Point at VIN barcode — window sticker / door jamb'; }, 1500);
-                        }
+                        // Got a barcode but not a VIN
+                        setTimeout(() => { if (st && !_vinLocked) st.textContent = 'Scanning… point at VIN barcode'; }, 1500);
                     }
-                } catch(e) {}
-                // Always keep scanning — never stop unless we locked in or modal was closed
-                if (!_vinLocked && document.getElementById('vinVideo')) {
-                    _runBarcodeDetector();
+                } catch(e) {
+                    if (st) st.textContent = 'Error: ' + e.message;
                 }
-            }, 120); // ~8fps
+                if (!_vinLocked && document.getElementById('vinVideo')) _runBarcodeDetector();
+            }, 150);
         }
 
         // PATH B: Dynamic ZXing fallback for older devices / Safari < 17
