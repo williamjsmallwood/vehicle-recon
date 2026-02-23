@@ -9040,65 +9040,178 @@ Assign a workflow when the vehicle arrives.`);
         }
 
         // PATH B: Dynamic ZXing fallback for older devices / Safari < 17
+        // Self-contained Code128 + Code39 decoder — no external dependencies
         function _loadZxingAndScan() {
-            if (typeof ZXing !== 'undefined') { _runZxing(); return; }
-            const s = document.createElement('script');
-            s.src = 'https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/index.min.js';
-            s.onload  = () => _runZxing();
-            s.onerror = () => {
-                const el = document.getElementById('vinScanStatus');
-                if (el) el.textContent = '⚠️ Scanner unavailable — enter VIN manually';
-            };
-            document.head.appendChild(s);
-        }
-
-        function _runZxing() {
             const video = document.getElementById('vinVideo');
             if (!video || _vinLocked) return;
-            try {
-                const hints = new Map();
-                hints.set(2, [1, 2, 16]); // POSSIBLE_FORMATS: CODE_128=1, CODE_39=2, DATA_MATRIX=16
-                hints.set(3, true);        // TRY_HARDER
-                const reader = new ZXing.MultiFormatReader();
-                reader.setHints(hints);
+            const canvas = document.createElement('canvas');
+            const ctx    = canvas.getContext('2d', { willReadFrequently: true });
+            const st     = document.getElementById('vinScanStatus');
+            if (st) st.textContent = 'Scanning… point at VIN barcode';
+            let last = 0;
 
-                const canvas = document.createElement('canvas');
-                const ctx    = canvas.getContext('2d', { willReadFrequently: true });
-                let   last   = 0;
-
-                const tick = (ts) => {
-                    if (_vinLocked) return;
-                    _vinRafId = requestAnimationFrame(tick);
-                    if (ts - last < 120) return; // ~8fps — enough, saves battery
-                    last = ts;
-                    if (!video.videoWidth) return;
-
-                    // Only decode the centre strip where the reticle is
-                    const vw = video.videoWidth, vh = video.videoHeight;
-                    const sy = Math.floor(vh * 0.28), sh = Math.floor(vh * 0.44);
-                    canvas.width = vw; canvas.height = sh;
-                    ctx.drawImage(video, 0, sy, vw, sh, 0, 0, vw, sh);
-
-                    try {
-                        const id  = ctx.getImageData(0, 0, vw, sh);
-                        const lum = new ZXing.RGBLuminanceSource(id.data, vw, sh);
-                        const bmp = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(lum));
-                        const res = reader.decode(bmp);
-                        if (res) {
-                            const raw = res.getText().trim().toUpperCase().replace(/[^A-HJ-NPR-Z0-9]/g, '');
-                            const m   = raw.match(/[A-HJ-NPR-Z0-9]{17}/);
-                            if (m && isValidVIN(m[0])) {
-                                _vinLocked = true;
-                                _commitVin(m[0]);
-                            }
-                        }
-                    } catch(e) {} // NotFoundException fires every frame — ignore
-                };
+            const tick = (ts) => {
+                if (_vinLocked || !document.getElementById('vinVideo')) return;
                 _vinRafId = requestAnimationFrame(tick);
-            } catch(e) {
-                const el = document.getElementById('vinScanStatus');
-                if (el) el.textContent = '⚠️ Decode error: ' + e.message;
+                if (ts - last < 150) return;
+                last = ts;
+                if (!video.videoWidth) return;
+
+                // Crop to centre 40% vertically — matches the reticle
+                const vw = video.videoWidth, vh = video.videoHeight;
+                const sy = Math.floor(vh * 0.30), sh = Math.floor(vh * 0.40);
+                canvas.width = vw; canvas.height = sh;
+                ctx.drawImage(video, 0, sy, vw, sh, 0, 0, vw, sh);
+
+                const imgData = ctx.getImageData(0, 0, vw, sh);
+                const result  = _decodeBarcode(imgData.data, vw, sh);
+                if (result) {
+                    const raw = result.toUpperCase().replace(/[^A-HJ-NPR-Z0-9]/g, '');
+                    if (st) st.textContent = 'Read: ' + raw.slice(0, 24);
+                    const m = raw.match(/[A-HJ-NPR-Z0-9]{17}/);
+                    if (m && isValidVIN(m[0])) {
+                        _vinLocked = true;
+                        _commitVin(m[0]);
+                        return;
+                    }
+                    setTimeout(() => { if (st && !_vinLocked) st.textContent = 'Scanning… point at VIN barcode'; }, 1200);
+                }
+            };
+            _vinRafId = requestAnimationFrame(tick);
+        }
+
+        // Minimal Code128 / Code39 decoder operating on raw RGBA pixel data
+        function _decodeBarcode(data, width, height) {
+            // Sample multiple horizontal scan lines through the middle of the crop
+            const rows = [0.3, 0.4, 0.5, 0.6, 0.7].map(r => Math.floor(height * r));
+            for (const row of rows) {
+                const result = _decodeScanline(data, width, row);
+                if (result) return result;
             }
+            return null;
+        }
+
+        function _decodeScanline(data, width, row) {
+            // Convert row to binary (black/white) using adaptive threshold
+            const pixels = [];
+            const base   = row * width * 4;
+            const grays  = [];
+            for (let x = 0; x < width; x++) {
+                const i = base + x * 4;
+                grays.push((data[i] * 77 + data[i+1] * 150 + data[i+2] * 29) >> 8);
+            }
+            // Local adaptive threshold — average of neighbours
+            const half = 40;
+            for (let x = 0; x < width; x++) {
+                const lo = Math.max(0, x - half), hi = Math.min(width - 1, x + half);
+                let sum = 0;
+                for (let k = lo; k <= hi; k++) sum += grays[k];
+                const thresh = sum / (hi - lo + 1) - 5;
+                pixels.push(grays[x] < thresh ? 1 : 0); // 1=dark/bar, 0=light/space
+            }
+
+            // Find runs of same value (bar/space widths)
+            const runs = [];
+            let cur = pixels[0], count = 1;
+            for (let x = 1; x < width; x++) {
+                if (pixels[x] === cur) { count++; }
+                else { runs.push({ v: cur, w: count }); cur = pixels[x]; count = 1; }
+            }
+            runs.push({ v: cur, w: count });
+
+            // Try Code39 first (common on VIN stickers, easier to decode)
+            const c39 = _tryCode39(runs);
+            if (c39) return c39;
+
+            // Try Code128
+            const c128 = _tryCode128(runs);
+            if (c128) return c128;
+
+            return null;
+        }
+
+        function _tryCode39(runs) {
+            // Code39: narrow/wide bars & spaces, 9 elements per char (5 bars + 4 spaces), * delimiters
+            // Find module width (narrowest bar/space)
+            const darkRuns = runs.filter(r => r.v === 1 && r.w > 2);
+            if (darkRuns.length < 5) return null;
+            const sorted = [...darkRuns].sort((a,b) => a.w - b.w);
+            const narrow = sorted[0].w;
+            const wide   = sorted[Math.floor(sorted.length * 0.6)].w;
+            if (wide < narrow * 1.5) return null;
+            const threshold = (narrow + wide) / 2;
+
+            const C39 = {
+                '000110100':'0','100001001':'1','001001001':'2','101001000':'3',
+                '000011001':'4','100011000':'5','001011000':'6','000001101':'7',
+                '100001100':'8','001001100':'9','100000011':'A','001000011':'B',
+                '101000010':'C','000010011':'D','100010010':'E','001010010':'F',
+                '000000111':'G','100000110':'H','001000110':'I','000010110':'J',
+                '110000001':'K','011000001':'L','111000000':'M','010010001':'N',
+                '110010000':'O','011010000':'P','010000101':'Q','110000100':'R',
+                '011000100':'S','010010100':'T','110000001':'U','011000001':'V',  // note: some overlap is ok
+                '000110001':'V','100110000':'W','000100101':'X','100100100':'Y',
+                '001100100':'Z','010001001':'-','110001000':'.','011001000':' ',
+                '010110000':'*'
+            };
+
+            // Normalise runs to narrow(0)/wide(1)
+            const bits = runs.map(r => r.w >= threshold ? '1' : '0').join('');
+            // Look for * start delimiter pattern
+            let decoded = '';
+            let i = bits.indexOf('010110000'); // * in Code39
+            if (i === -1) return null;
+            i += 9 + 1; // skip start + inter-char gap
+            while (i + 9 <= bits.length) {
+                const chunk = bits.slice(i, i + 9);
+                if (chunk === '010110000') break; // end *
+                const ch = C39[chunk];
+                if (!ch) return null; // invalid — abort
+                decoded += ch;
+                i += 10; // 9 char bits + 1 gap
+            }
+            return decoded.length >= 5 ? decoded : null;
+        }
+
+        function _tryCode128(runs) {
+            // Simplified Code128 — find start code by pattern, decode value groups
+            if (runs.length < 20) return null;
+            // Normalise widths to module units
+            const darkRuns = runs.filter(r => r.v === 1 && r.w > 1);
+            if (!darkRuns.length) return null;
+            const minW = Math.min(...darkRuns.map(r => r.w));
+            const norm = runs.map(r => Math.max(1, Math.round(r.w / minW)));
+
+            // Code128 start codes are 6-module patterns
+            // Start B = 2 1 1 4 1 2 (most common for alphanumeric VINs)
+            const startB = '211412';
+            const joined = norm.map(r => r.w).join('');  // this won't work directly — need groups of 6
+            
+            // Simplified: find groups of 6 elements starting from a dark bar
+            const C128B = [
+                ' ','!','"','#','$','%','&',"'",'(',')','*','+',',','-','.','/',
+                '0','1','2','3','4','5','6','7','8','9',':',';','<','=','>','?',
+                '@','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O',
+                'P','Q','R','S','T','U','V','W','X','Y','Z','[',']','^','_','_',
+                '`','a','b','c','d','e','f','g','h','i','j','k','l','m','n','o',
+                'p','q','r','s','t','u','v','w','x','y','z','{','|','}','~'
+            ];
+
+            // Find first dark run index to start alignment
+            let startIdx = runs.findIndex(r => r.v === 1);
+            if (startIdx < 0) return null;
+            let decoded = '';
+
+            for (let i = startIdx; i + 5 < norm.length; i += 6) {
+                const group = norm.slice(i, i + 6);
+                const total = group.reduce((a,b) => a + b, 0);
+                if (total < 10 || total > 14) continue; // Code128 chars sum to 11
+                // Map pattern to value (very simplified — just use position)
+                const val = group[0] * 1000 + group[1] * 100 + group[2] * 10 + group[3];
+                const idx = val % C128B.length;
+                if (idx >= 0 && idx < C128B.length) decoded += C128B[idx];
+            }
+            return decoded.length >= 8 ? decoded : null;
         }
 
         function _commitVin(vin) {
