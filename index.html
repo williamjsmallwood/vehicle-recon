@@ -9001,22 +9001,34 @@ Assign a workflow when the vehicle arrives.`);
             const video = document.getElementById('vinVideo');
             if (!video || _vinLocked) return;
 
-            _vinRafId = requestAnimationFrame(async () => {
-                if (_vinLocked || !video.videoWidth) { _runBarcodeDetector(); return; }
+            // Use setTimeout instead of rAF — avoids async pile-up and is fine at 8fps
+            setTimeout(async () => {
+                if (_vinLocked || !document.getElementById('vinVideo')) return;
                 try {
                     const barcodes = await _vinDetector.detect(video);
                     for (const b of barcodes) {
+                        // Show everything detected so user can see what the camera is reading
                         const raw = b.rawValue.trim().toUpperCase().replace(/[^A-HJ-NPR-Z0-9]/g, '');
-                        const m   = raw.match(/[A-HJ-NPR-Z0-9]{17}/);
+                        const st  = document.getElementById('vinScanStatus');
+
+                        const m = raw.match(/[A-HJ-NPR-Z0-9]{17}/);
                         if (m && isValidVIN(m[0])) {
                             _vinLocked = true;
                             _commitVin(m[0]);
                             return;
                         }
+                        // Detected something but it's not a valid VIN — show it so user knows camera is working
+                        if (st && raw.length > 3) {
+                            st.textContent = 'Saw: ' + raw.slice(0, 20) + (raw.length > 20 ? '…' : '') + ' (not a VIN — keep scanning)';
+                            setTimeout(() => { if (st) st.textContent = 'Point at VIN barcode — window sticker / door jamb'; }, 1500);
+                        }
                     }
                 } catch(e) {}
-                _runBarcodeDetector();
-            });
+                // Always keep scanning — never stop unless we locked in or modal was closed
+                if (!_vinLocked && document.getElementById('vinVideo')) {
+                    _runBarcodeDetector();
+                }
+            }, 120); // ~8fps
         }
 
         // PATH B: Dynamic ZXing fallback for older devices / Safari < 17
@@ -9083,12 +9095,26 @@ Assign a workflow when the vehicle arrives.`);
 
         function _commitVin(vin) {
             if (navigator.vibrate) navigator.vibrate([80, 50, 80]);
-            const el = document.getElementById('vinScanStatus');
-            if (el) { el.style.color = '#68d391'; el.textContent = '✅ ' + vin; }
+            // Flash the reticle green
+            const line = document.getElementById('vinScanLine');
+            if (line) line.style.background = '#68d391';
+            const st = document.getElementById('vinScanStatus');
+            if (st) { st.style.color = '#68d391'; st.textContent = '✅ Got it: ' + vin; }
+            // Stop the camera stream immediately (we have what we need)
+            if (_vinStream) { _vinStream.getTracks().forEach(t => t.stop()); _vinStream = null; }
+            if (_vinRafId)  { cancelAnimationFrame(_vinRafId); _vinRafId = null; }
             setTimeout(() => {
-                closeVinScanner();
+                document.getElementById('vinScanModal')?.remove();
                 _onVinDetected(vin);
-            }, 500);
+            }, 600);
+        }
+
+        function closeVinScanner() {
+            _vinLocked = true;
+            if (_vinRafId)  { cancelAnimationFrame(_vinRafId); _vinRafId = null; }
+            if (_vinStream) { _vinStream.getTracks().forEach(t => t.stop()); _vinStream = null; }
+            _vinDetector = null;
+            document.getElementById('vinScanModal')?.remove();
         }
 
         async function _onVinDetected(vin) {
@@ -9124,14 +9150,6 @@ VIN filled in — admin can proceed to add.`);
             }
             const input = document.getElementById(_vinTargetInputId);
             if (input) { input.value = vin; input.focus(); input.style.background='#c6f6d5'; setTimeout(()=>{input.style.background='';},1500); }
-        }
-
-        function closeVinScanner() {
-            _vinLocked = true;
-            if (_vinRafId) { cancelAnimationFrame(_vinRafId); _vinRafId = null; }
-            if (_vinStream) { _vinStream.getTracks().forEach(t => t.stop()); _vinStream = null; }
-            _vinDetector = null;
-            document.getElementById('vinScanModal')?.remove();
         }
 
 raStream = null;
