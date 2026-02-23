@@ -7,7 +7,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <title>Vehicle Recon Management System</title>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-    <script src="https://cdn.jsdelivr.net/npm/quagga@0.12.1/dist/quagga.min.js"></script>
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -8906,204 +8906,135 @@ Assign a workflow when the vehicle arrives.`);
         // ==================== VIN BARCODE SCANNER ====================
 
         let _vinTargetInputId = null;
+        let _vinHtml5QrScanner = null;
+
+        // ISO 3779 VIN checksum validation
+        function isValidVIN(vin) {
+            if (!vin || vin.length !== 17) return false;
+            if (/[IOQ]/.test(vin)) return false;
+            if (!/^[A-HJ-NPR-Z0-9]{17}$/.test(vin)) return false;
+            const xlat = {A:1,B:2,C:3,D:4,E:5,F:6,G:7,H:8,J:1,K:2,L:3,M:4,N:5,P:7,R:9,S:2,T:3,U:4,V:5,W:6,X:7,Y:8,Z:9,0:0,1:1,2:2,3:3,4:4,5:5,6:6,7:7,8:8,9:9};
+            const wt  = [8,7,6,5,4,3,2,10,0,9,8,7,6,5,4,3,2];
+            let sum = 0;
+            for (let i = 0; i < 17; i++) { const v = xlat[vin[i]]; if (v === undefined) return false; sum += v * wt[i]; }
+            const rem = sum % 11;
+            return vin[8] === (rem === 10 ? 'X' : String(rem));
+        }
+
+        let _vinReadCounts = {};
 
         async function openVinScanner(targetInputId = 'newVIN') {
             _vinTargetInputId = targetInputId;
-            document.getElementById('vinScanModal')?.remove();
+            _vinReadCounts    = {};
+            closeVinScanner();
 
             const modal = document.createElement('div');
             modal.id = 'vinScanModal';
             modal.style.cssText = 'position:fixed;inset:0;background:#000;z-index:10000;display:flex;flex-direction:column;';
             modal.innerHTML = `
-                <div style="position:relative;flex:1;overflow:hidden;">
-                    <!-- Quagga renders its own <video> + <canvas> into this div -->
+                <div style="position:relative;flex:1;overflow:hidden;background:#000;">
+                    <!-- html5-qrcode mounts its video here -->
                     <div id="vinScanViewport" style="width:100%;height:100%;"></div>
 
-                    <!-- Targeting overlay (purely visual) -->
-                    <div style="position:absolute;inset:0;pointer-events:none;">
-                        <div style="position:absolute;top:0;left:0;right:0;height:28%;background:rgba(0,0,0,0.6);"></div>
-                        <div style="position:absolute;bottom:0;left:0;right:0;height:28%;background:rgba(0,0,0,0.6);"></div>
-                        <div style="position:absolute;top:28%;left:4%;right:4%;height:44%;border:3px solid #4299e1;border-radius:10px;">
+                    <!-- Visual overlay -->
+                    <div style="position:absolute;inset:0;pointer-events:none;z-index:2;">
+                        <div style="position:absolute;top:0;left:0;right:0;height:28%;background:rgba(0,0,0,0.55);"></div>
+                        <div style="position:absolute;bottom:0;left:0;right:0;height:28%;background:rgba(0,0,0,0.55);"></div>
+                        <div style="position:absolute;top:28%;left:5%;right:5%;height:44%;border:3px solid #4299e1;border-radius:10px;">
                             <div style="position:absolute;top:-3px;left:-3px;width:22px;height:22px;border-top:4px solid #63b3ed;border-left:4px solid #63b3ed;border-radius:3px 0 0 0;"></div>
                             <div style="position:absolute;top:-3px;right:-3px;width:22px;height:22px;border-top:4px solid #63b3ed;border-right:4px solid #63b3ed;border-radius:0 3px 0 0;"></div>
                             <div style="position:absolute;bottom:-3px;left:-3px;width:22px;height:22px;border-bottom:4px solid #63b3ed;border-left:4px solid #63b3ed;border-radius:0 0 0 3px;"></div>
                             <div style="position:absolute;bottom:-3px;right:-3px;width:22px;height:22px;border-bottom:4px solid #63b3ed;border-right:4px solid #63b3ed;border-radius:0 0 3px 0;"></div>
-                            <div id="vinScanLine" style="position:absolute;left:0;right:0;height:2px;background:#63b3ed;opacity:0.85;top:50%;animation:vinScanAnim 2s ease-in-out infinite;"></div>
+                            <div style="position:absolute;left:0;right:0;height:2px;background:#63b3ed;opacity:0.9;top:50%;animation:vinScanAnim 2s ease-in-out infinite;"></div>
                         </div>
                     </div>
 
                     <!-- Header -->
-                    <div style="position:absolute;top:0;left:0;right:0;padding:14px 16px;display:flex;justify-content:space-between;align-items:center;background:linear-gradient(to bottom,rgba(0,0,0,0.65),transparent);z-index:10;">
+                    <div style="position:absolute;top:0;left:0;right:0;padding:14px 16px;display:flex;justify-content:space-between;align-items:center;z-index:5;background:linear-gradient(to bottom,rgba(0,0,0,0.7),transparent);">
                         <span style="color:white;font-size:14px;font-weight:700;">🔍 Scan VIN Barcode</span>
-                        <button onclick="closeVinScanner()" style="background:rgba(255,255,255,0.2);border:none;color:white;border-radius:50%;width:36px;height:36px;font-size:18px;cursor:pointer;z-index:10;">✕</button>
+                        <button onclick="closeVinScanner()" style="background:rgba(255,255,255,0.2);border:none;color:white;border-radius:50%;width:38px;height:38px;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;">✕</button>
                     </div>
 
-                    <!-- Status bar -->
-                    <div style="position:absolute;bottom:0;left:0;right:0;padding:12px 16px 22px;background:linear-gradient(to top,rgba(0,0,0,0.75),transparent);text-align:center;z-index:10;">
-                        <div id="vinScanStatus" style="color:white;font-size:13px;font-weight:600;">Point at VIN barcode — window sticker / door jamb / rear of vehicle</div>
-                        <div style="margin-top:8px;">
-                            <label style="color:#a0aec0;font-size:12px;cursor:pointer;">
-                                Can't scan? &nbsp;
-                                <span style="color:#63b3ed;text-decoration:underline;">
-                                    Enter manually
-                                </span>
-                                <input type="file" accept="image/*" style="display:none"
-                                    onchange="scanImageFile(event)">
-                            </label>
-                        </div>
+                    <!-- Status -->
+                    <div style="position:absolute;bottom:0;left:0;right:0;padding:12px 16px 24px;z-index:5;background:linear-gradient(to top,rgba(0,0,0,0.75),transparent);text-align:center;">
+                        <div id="vinScanStatus" style="color:white;font-size:13px;font-weight:600;">Point at VIN barcode — window sticker / door jamb</div>
                     </div>
                 </div>
                 <style>
                     @keyframes vinScanAnim { 0%,100%{top:10%} 50%{top:85%} }
-                    #vinScanViewport video  { width:100% !important; height:100% !important; object-fit:cover !important; }
-                    #vinScanViewport canvas { position:absolute !important; top:0 !important; left:0 !important; width:100% !important; height:100% !important; opacity:0.35 !important; }
+                    #vinScanViewport video  { position:absolute!important;top:0!important;left:0!important;width:100%!important;height:100%!important;object-fit:cover!important; }
+                    #vinScanViewport canvas { display:none!important; }
+                    #vinScanViewport img    { display:none!important; }
+                    #vinScanViewport *[id$="dashboard"], #vinScanViewport *[id$="header"] { display:none!important; }
                 </style>
             `;
             document.body.appendChild(modal);
-            _startQuagga();
-        }
 
-        // VIN validation — checks structure, length, forbidden chars (I O Q), and checksum
-        function isValidVIN(vin) {
-            if (!vin || vin.length !== 17) return false;
-            // I, O, Q are never valid in a VIN
-            if (/[IOQ]/.test(vin)) return false;
-            // Must be alphanumeric only
-            if (!/^[A-HJ-NPR-Z0-9]{17}$/.test(vin)) return false;
-            // ISO 3779 check digit (position 9)
-            const transliteration = {
-                'A':1,'B':2,'C':3,'D':4,'E':5,'F':6,'G':7,'H':8,
-                'J':1,'K':2,'L':3,'M':4,'N':5,       'P':7,'R':9,
-                      'S':2,'T':3,'U':4,'V':5,'W':6,'X':7,'Y':8,'Z':9,
-                '0':0,'1':1,'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9
-            };
-            const weights = [8,7,6,5,4,3,2,10,0,9,8,7,6,5,4,3,2];
-            let sum = 0;
-            for (let i = 0; i < 17; i++) {
-                const val = transliteration[vin[i]];
-                if (val === undefined) return false;
-                sum += val * weights[i];
+            try {
+                _vinHtml5QrScanner = new Html5Qrcode('vinScanViewport', { verbose: false });
+
+                const config = {
+                    fps: 10,
+                    qrbox: undefined,        // scan full frame — our CSS overlay is visual only
+                    aspectRatio: 1.777,
+                    formatsToSupport: [
+                        Html5QrcodeSupportedFormats.CODE_128,
+                        Html5QrcodeSupportedFormats.CODE_39,
+                        Html5QrcodeSupportedFormats.DATA_MATRIX,
+                    ],
+                    experimentalFeatures: { useBarCodeDetectorIfSupported: true }
+                };
+
+                await _vinHtml5QrScanner.start(
+                    { facingMode: 'environment' },
+                    config,
+                    _onQrSuccess,
+                    _onQrError
+                );
+            } catch(err) {
+                console.error('Scanner start error:', err);
+                const st = document.getElementById('vinScanStatus');
+                if (st) st.textContent = '⚠️ ' + (err.message || 'Camera unavailable');
             }
-            const remainder = sum % 11;
-            const checkDigit = remainder === 10 ? 'X' : String(remainder);
-            return vin[8] === checkDigit;
         }
 
-        let _vinCandidates = {}; // track consecutive consistent reads
+        function _onQrSuccess(decodedText) {
+            const raw = decodedText.trim().toUpperCase().replace(/[^A-HJ-NPR-Z0-9]/g, '');
+            // Try to pull a 17-char VIN out — some stickers embed extra data around it
+            const vinMatch = raw.match(/[A-HJ-NPR-Z0-9]{17}/);
+            if (!vinMatch) return;
+            const candidate = vinMatch[0];
 
-        function _startQuagga() {
-            if (typeof Quagga === 'undefined') {
-                document.getElementById('vinScanStatus').textContent = '⚠️ Scanner library not loaded';
+            // Must pass ISO checksum — kills all numeric garbage reads
+            if (!isValidVIN(candidate)) {
+                const st = document.getElementById('vinScanStatus');
+                if (st) st.textContent = 'Detected: ' + candidate.slice(0,8) + '… (verifying)';
                 return;
             }
 
-            _vinCandidates = {};
+            // Require 2 consistent reads of the same VIN before committing
+            _vinReadCounts[candidate] = (_vinReadCounts[candidate] || 0) + 1;
+            const st = document.getElementById('vinScanStatus');
 
-            Quagga.init({
-                inputStream: {
-                    name: 'Live',
-                    type: 'LiveStream',
-                    target: document.getElementById('vinScanViewport'),
-                    constraints: {
-                        width:  { min: 640, ideal: 1920, max: 1920 },
-                        height: { min: 480, ideal: 1080, max: 1080 },
-                        facingMode: 'environment',
-                    },
-                    area: { top: '28%', right: '4%', left: '4%', bottom: '28%' },
-                },
-                locator: {
-                    patchSize: 'large',   // larger patches = better for long VIN barcodes
-                    halfSample: false      // full resolution decode — worth the CPU cost
-                },
-                numOfWorkers: 0,           // 0 = main thread, avoids worker issues on iOS Safari
-                frequency: 8,
-                decoder: {
-                    // ONLY Code128 and Code39 — VINs are never i2of5/numeric formats
-                    // i2of5 was the culprit producing all-number garbage
-                    readers: [
-                        'code_128_reader',
-                        'code_39_reader',
-                        'code_39_vin_reader',
-                    ],
-                    multiple: false
-                },
-                locate: true
-            }, function(err) {
-                if (err) {
-                    console.error('Quagga init error:', err);
-                    const st = document.getElementById('vinScanStatus');
-                    if (st) st.textContent = '⚠️ Camera error: ' + (err.message || err);
-                    return;
-                }
-                Quagga.start();
-            });
+            if (_vinReadCounts[candidate] < 2) {
+                if (st) st.textContent = 'Reading… ' + candidate;
+                return;
+            }
 
-            Quagga.onDetected(function(result) {
-                const code = result.codeResult;
-                if (!code || !code.code) return;
-
-                // Confidence filter — reject sloppy reads
-                const errors = (code.decodedCodes || [])
-                    .filter(c => c.error !== undefined)
-                    .map(c => c.error);
-                const avgErr = errors.length ? errors.reduce((a,b) => a+b, 0) / errors.length : 1;
-                if (avgErr > 0.15) return;
-
-                // Normalise — strip spaces/dashes, uppercase
-                const raw = code.code.trim().toUpperCase().replace(/[\s\-]/g, '');
-
-                // Try to extract a 17-char VIN-charset substring
-                const vinMatch = raw.match(/[A-HJ-NPR-Z0-9]{17}/);
-                if (!vinMatch) return;
-                const candidate = vinMatch[0];
-
-                // Hard reject: must pass ISO 3779 checksum
-                if (!isValidVIN(candidate)) return;
-
-                // Require 3 consistent reads of the same VIN before accepting
-                // (eliminates single-frame flukes)
-                _vinCandidates[candidate] = (_vinCandidates[candidate] || 0) + 1;
-                const count = _vinCandidates[candidate];
-
-                const statusEl = document.getElementById('vinScanStatus');
-                if (count < 3) {
-                    // Show progress feedback without locking in yet
-                    if (statusEl) statusEl.textContent = `Reading… (${count}/3) ${candidate}`;
-                    return;
-                }
-
-                // Locked in
-                Quagga.stop();
-                _vinCandidates = {};
-                _onVinDetected(candidate);
-            });
+            // Confirmed — stop and commit
+            closeVinScanner(false);   // false = don't clear the modal yet, _onVinDetected will
+            _onVinDetected(candidate);
         }
 
-        // Fallback: scan from a photo file the user picks
-        async function scanImageFile(event) {
-            const file = event.target.files[0];
-            if (!file || typeof Quagga === 'undefined') return;
-            const url = URL.createObjectURL(file);
-            Quagga.decodeSingle({
-                decoder: { readers: ['code_128_reader','code_39_reader','code_39_vin_reader'] },
-                locate: true,
-                src: url
-            }, function(result) {
-                URL.revokeObjectURL(url);
-                if (result && result.codeResult && result.codeResult.code) {
-                    const raw = result.codeResult.code.trim().toUpperCase().replace(/[^A-Z0-9]/g,'');
-                    const vinMatch = raw.match(/[A-HJ-NPR-Z0-9]{17}/);
-                    if (vinMatch) { closeVinScanner(); _onVinDetected(vinMatch[0]); return; }
-                }
-                alert('Could not read a VIN from that image. Try better lighting or a closer shot.');
-            });
+        function _onQrError(err) {
+            // Fires constantly on every frame with no barcode — suppress unless it's a real error
+            if (err && typeof err === 'string' && err.includes('No MultiFormat')) return;
         }
 
         async function _onVinDetected(vin) {
-            const statusEl = document.getElementById('vinScanStatus');
             if (navigator.vibrate) navigator.vibrate([80, 50, 80]);
 
-            // Real-time duplicate check while scanner is still showing result
+            // Real-time duplicate check
             if (supabaseClient && currentLocationId) {
                 try {
                     const { data: vinMatches } = await supabaseClient
@@ -9118,46 +9049,45 @@ Assign a workflow when the vehicle arrives.`);
 
                         if (active.length > 0) {
                             const v = active[0];
-                            if (statusEl) { statusEl.style.color = '#fc8181'; statusEl.textContent = `⚠️ Already on board — Stock #${v.stock_number} · ${v.current_step}`; }
-                            setTimeout(() => {
-                                closeVinScanner();
-                                alert(`⚠️ VIN ALREADY IN ACTIVE INVENTORY
+                            alert(`⚠️ VIN ALREADY IN ACTIVE INVENTORY
 
 Stock #: ${v.stock_number}
 Vehicle: ${v.year||''} ${v.make||''} ${v.model||''}
 Current Step: ${v.current_step}
 
-This car is already being tracked.`);
-                            }, 1400);
+This car is already on the board.`);
                             return;
                         }
                         if (completed.length > 0) {
                             const v = completed[0];
                             const d = v.updated_at ? new Date(v.updated_at).toLocaleDateString() : '?';
-                            if (statusEl) { statusEl.style.color = '#f6ad55'; statusEl.textContent = `ℹ️ Previous recon — Stock #${v.stock_number} · ${d}`; }
-                            setTimeout(() => {
-                                closeVinScanner();
-                                const input = document.getElementById(_vinTargetInputId);
-                                if (input) { input.value = vin; input.style.background='#fefcbf'; setTimeout(()=>{input.style.background='';},2000); }
-                            }, 1400);
+                            const input = document.getElementById(_vinTargetInputId);
+                            if (input) { input.value = vin; input.style.background='#fefcbf'; setTimeout(()=>{input.style.background='';},2000); }
+                            alert(`ℹ️ This VIN completed recon on ${d} as Stock #${v.stock_number}.
+
+VIN has been filled in. An admin can proceed to add it as a new entry.`);
                             return;
                         }
                     }
                 } catch(e) { console.warn('VIN lookup:', e.message); }
             }
 
-            // Clean VIN
-            if (statusEl) { statusEl.style.color = '#68d391'; statusEl.textContent = '✅ VIN: ' + vin; }
-            setTimeout(() => {
-                closeVinScanner();
-                const input = document.getElementById(_vinTargetInputId);
-                if (input) { input.value = vin; input.focus(); input.style.background='#c6f6d5'; setTimeout(()=>{input.style.background='';},1500); }
-            }, 600);
+            // Clean — populate field
+            const input = document.getElementById(_vinTargetInputId);
+            if (input) {
+                input.value = vin;
+                input.focus();
+                input.style.background = '#c6f6d5';
+                setTimeout(() => { input.style.background = ''; }, 1500);
+            }
         }
 
-        function closeVinScanner() {
-            try { Quagga.stop(); } catch(e) {}
-            document.getElementById('vinScanModal')?.remove();
+        function closeVinScanner(removeModal = true) {
+            if (_vinHtml5QrScanner) {
+                _vinHtml5QrScanner.stop().catch(() => {});
+                _vinHtml5QrScanner = null;
+            }
+            if (removeModal) document.getElementById('vinScanModal')?.remove();
         }
 
         // ==================== CAMERA MODAL ====================
