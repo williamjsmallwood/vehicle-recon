@@ -8965,47 +8965,38 @@ Assign a workflow when the vehicle arrives.`);
             // Start camera
             try {
                 _vinStream = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+                    video: { facingMode: { ideal: 'environment' } },
                     audio: false
                 });
-                const video = document.getElementById('vinVideo');
-                video.srcObject = _vinStream;
-                await video.play();
-                setStatus('Point at VIN barcode — window sticker / door jamb');
             } catch(err) {
                 setStatus('⚠️ Camera error: ' + (err.message || err));
                 return;
             }
 
-            // Detect supported formats — iOS uses dashes, Android uses underscores
-            const hasBarcodeDetector = typeof BarcodeDetector !== 'undefined';
+            const video = document.getElementById('vinVideo');
+            video.srcObject = _vinStream;
+            video.onloadedmetadata = () => {
+                video.play().catch(() => {});
+            };
 
-            if (hasBarcodeDetector) {
-                // Get what this device actually supports, then pick VIN-relevant ones
-                const supported = await BarcodeDetector.getSupportedFormats().catch(() => []);
-                setStatus('Camera ready — formats: ' + (supported.length ? supported.join(', ') : 'all'));
-                // Try with specific formats first; fall back to no filter (all formats) if that fails
-                try {
-                    const vinFormats = supported.filter(f =>
-                        ['code_128','code-128','code_39','code-39','data_matrix','pdf417'].includes(f)
-                    );
-                    _vinDetector = new BarcodeDetector({ formats: vinFormats.length ? vinFormats : supported });
-                } catch(e) {
-                    _vinDetector = new BarcodeDetector();
+            // Give video 1.5s to start then kick off scanning regardless
+            setTimeout(() => {
+                if (_vinLocked) return;
+                setStatus('Scanning… point at VIN barcode');
+                // Try native BarcodeDetector — skip getSupportedFormats() entirely, just try it
+                if (typeof BarcodeDetector !== 'undefined') {
+                    try {
+                        _vinDetector = new BarcodeDetector({ formats: ['code_128', 'code_39', 'code-128', 'code-39', 'data_matrix'] });
+                    } catch(e) {
+                        try { _vinDetector = new BarcodeDetector(); } catch(e2) { _vinDetector = null; }
+                    }
                 }
-                // Wait for video to actually have frames before starting
-                video.addEventListener('playing', () => {
-                    setStatus('Scanning… point at VIN barcode');
+                if (_vinDetector) {
                     _runBarcodeDetector();
-                }, { once: true });
-                if (!video.paused && video.readyState >= 3) {
-                    setStatus('Scanning… point at VIN barcode');
-                    _runBarcodeDetector();
+                } else {
+                    _loadZxingAndScan();
                 }
-            } else {
-                setStatus('Loading scanner…');
-                _loadZxingAndScan();
-            }
+            }, 1500);
         }
 
         // PATH A: Native BarcodeDetector
