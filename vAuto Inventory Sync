@@ -1,0 +1,28 @@
+name: vAuto Inventory Sync
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Runs 6 AM daily (after vAuto's nightly push)
+  workflow_dispatch:       # Lets you trigger it manually anytime
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm install basic-ftp csv-parse @supabase/supabase-js
+
+      - name: Run sync
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: node scripts/vauto-sync.js
