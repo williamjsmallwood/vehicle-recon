@@ -2,8 +2,8 @@ name: vAuto Inventory Sync
 
 on:
   schedule:
-    - cron: '0 6 * * *'  # Runs 6 AM daily (after vAuto's nightly push)
-  workflow_dispatch:       # Lets you trigger it manually anytime
+    - cron: '0 6 * * *'  # Runs 6 AM daily after vAuto's nightly push
+  workflow_dispatch:       # Lets you trigger manually anytime
 
 jobs:
   sync:
