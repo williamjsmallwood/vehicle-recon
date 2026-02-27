@@ -1,37 +1,59 @@
-const ftp = require('basic-ftp');
 const { createClient } = require('@supabase/supabase-js');
-const fs = require('fs');
+const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { parse } = require('csv-parse/sync');
+const { Readable } = require('stream');
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
 
-// Add more stores here as you onboard them
+const s3 = new S3Client({
+  endpoint: `https://${process.env.B2_ENDPOINT}`,
+  region: 'us-east-005',
+  credentials: {
+    accessKeyId: process.env.B2_KEY_ID,
+    secretAccessKey: process.env.B2_APP_KEY,
+  },
+});
+
 const STORES = [
   {
     storeCode: 'L499',
     storeName: 'Elder Ford Tampa',
-    filename: 'L499_inventory.csv',   // ask vAuto to name it this
-    remotePath: '/L499_inventory.csv'
+    filename: 'L499_inventory.csv',
   },
+  // Add more stores here as you onboard them
   // {
   //   storeCode: 'L500',
-  //   storeName: 'Next Store Name',
+  //   storeName: 'Next Store',
   //   filename: 'L500_inventory.csv',
-  //   remotePath: '/L500_inventory.csv'
   // },
 ];
 
-async function syncStore(client, store) {
+async function streamToString(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on('data', chunk => chunks.push(chunk));
+    stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    stream.on('error', reject);
+  });
+}
+
+async function syncStore(store) {
   console.log(`\n📦 Syncing ${store.storeName} (${store.storeCode})...`);
 
   try {
-    await client.downloadTo(store.filename, store.remotePath);
+    const command = new GetObjectCommand({
+      Bucket: process.env.B2_BUCKET,
+      Key: store.filename,
+    });
+
+    const response = await s3.send(command);
+    const csvText = await streamToString(response.Body);
     console.log(`✅ File downloaded for ${store.storeCode}`);
 
-    const records = parse(fs.readFileSync(store.filename, 'utf8'), {
+    const records = parse(csvText, {
       columns: true,
       skip_empty_lines: true
     });
@@ -47,7 +69,7 @@ async function syncStore(client, store) {
         model:        r['Model']        || '',
         miles:        parseInt(r['Miles'] || r['Mileage']) || 0,
         color:        r['Ext Color']    || r['Color'] || '',
-        store_code:   store.storeCode,        // tags every vehicle with the store
+        store_code:   store.storeCode,
         store_name:   store.storeName,
       }))
       .filter(v => v.vin.length > 5);
@@ -62,8 +84,27 @@ async function syncStore(client, store) {
     console.log(`✅ Synced ${vehicles.length} vehicles for ${store.storeName}`);
 
   } catch (err) {
-    if (err.message.includes('550')) {
+    if (err.name === 'NoSuchKey') {
       console.log(`⚠️ No file found for ${store.storeCode} - skipping`);
+      return;
+    }
+    throw err;
+  }
+}
+
+async function sync() {
+  try {
+    for (const store of STORES) {
+      await syncStore(store);
+    }
+    console.log('\n✅ All stores synced successfully');
+  } catch (err) {
+    console.error('❌ Sync failed:', err.message);
+    process.exit(1);
+  }
+}
+
+sync();      console.log(`⚠️ No file found for ${store.storeCode} - skipping`);
       return; // skip this store, don't fail the whole job
     }
     throw err;
