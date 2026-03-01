@@ -6559,6 +6559,12 @@ nano ~/scripts/vauto-sync.js</div>
             const setBar  = p => { const e = document.getElementById('arBar');   if(e) e.style.width = p + '%'; };
             const setNum  = (id,n) => { const e = document.getElementById(id);   if(e) e.textContent = n; };
 
+            // Safety timeout — removes overlay after 30s no matter what
+            var arSafetyTimer = setTimeout(function() {
+                var o = document.getElementById('autoReassignOverlay');
+                if (o) o.remove();
+            }, 30000);
+
             await new Promise(r => setTimeout(r, 80)); // let overlay paint
 
             let stepChangeCount = 0;
@@ -6612,15 +6618,20 @@ nano ~/scripts/vauto-sync.js</div>
             }));
 
             setBar(100);
-            setMsg('✓ Done!');
-            await new Promise(r => setTimeout(r, 600));
+            setMsg(eligible.length === 0 ? 'No eligible vehicles found.' : '✓ Done!');
+            await new Promise(r => setTimeout(r, eligible.length === 0 ? 1500 : 600));
 
+            clearTimeout(arSafetyTimer);
             const overlay = document.getElementById('autoReassignOverlay');
             if (overlay) overlay.remove();
 
             render();
-            if (stepChangeCount + techChangeCount > 0) {
+            if (eligible.length === 0) {
+                alert('No eligible vehicles to reassign.\n\nVehicles may be locked, finished, or already optimally assigned.');
+            } else if (stepChangeCount + techChangeCount > 0) {
                 alert('✓ Auto-reassignment complete!\n\n' + (stepChangeCount + techChangeCount) + ' total changes:\n• ' + stepChangeCount + ' step changes\n• ' + techChangeCount + ' technician changes');
+            } else {
+                alert('✓ All vehicles are already optimally assigned. No changes needed.');
             }
         }
 
